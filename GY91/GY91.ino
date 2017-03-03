@@ -319,30 +319,24 @@ void loop() {
     } while (more > 1);
 
     // Send Quaternion
-//    if (Serial.available() > 0) {
-//      String outputBuffer = String(q.x * 100000) + ',' +  // Convert the value to an ASCII string.
-//                            String(q.y * 100000) + ',' +
-//                            String(q.z * 100000) + ',' +
-//                            String(q.w * 100000) + ',' +
-//                            String(gyro[0] * 100000) + ',' +
-//                            String(gyro[1] * 100000) + ',' +
-//                            String(gyro[2] * 100000) + ',' +
-//                            String(a[0] * 100000) + ',' +
-//                            String(a[1] * 100000) + ',' +
-//                            String(a[2] * 100000) + '\n';     // Add the new line character.;
-//
-//      Serial.write(outputBuffer.c_str(), outputBuffer.length());
-//    }
+    if (Serial.available() > 0) {
+      String outputBuffer = String(q.x * 100000) + ',' +  // Convert the value to an ASCII string.
+                            String(q.y * 100000) + ',' +
+                            String(q.z * 100000) + ',' +
+                            String(q.w * 100000) + '\n';  // Add the new line character.;
+
+      Serial.write(outputBuffer.c_str(), outputBuffer.length());
+    }
 
 
     //Send LinearAccel
-    dmpGetGravity(gravity, &q);
-    dmpGetLinearAccel(realAccel, accel, gravity);
-
-    String outputBuffer = String(realAccel[0] ) + ',' +
-                          String(realAccel[1] ) + ',' +
-                          String(realAccel[2] ) + '\n';     // Add the new line character.;
-
-    Serial.write(outputBuffer.c_str(), outputBuffer.length());
+//    dmpGetGravity(gravity, &q);
+//    dmpGetLinearAccel(realAccel, accel, gravity);
+//
+//    String outputBuffer = String(realAccel[0] * 100000) + ',' +
+//                          String(realAccel[1] * 100000) + ',' +
+//                          String(realAccel[2] * 100000) + '\n';     // Add the new line character.;
+//
+//    Serial.write(outputBuffer.c_str(), outputBuffer.length());
   }
 }
