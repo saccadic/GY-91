@@ -5,8 +5,8 @@
 #include "helper_3dmath.h"
 
 extern "C" {
-  #include "inv_mpu.h"
-  #include "inv_mpu_dmp_motion_driver.h"
+#include "inv_mpu.h"
+#include "inv_mpu_dmp_motion_driver.h"
 }
 
 #define GYRO_250DPS  250
@@ -39,14 +39,20 @@ enum lpf_e {
 #define DMP_ON 1
 #define DMP_OFF 0
 
-static short sensors;
-static unsigned char fifoCount;
 Quaternion q;
 
 #include "BMP280.h"
 BMP280  bmp;
 #define BMP_OVERSAMPLING 4
 #define P0 1013.25
+
+short sensors;
+short gyro[3], accel[3], realAccel[3];
+unsigned char more = 0;
+long quat[4];
+long sensor_timestamp;
+
+float gravity[3];
 
 unsigned short inv_row_2_scale(const signed char *row)
 {
@@ -84,6 +90,21 @@ unsigned short inv_orientation_matrix_to_scalar(const signed char *mtx)
   scalar |= inv_row_2_scale(mtx + 3) << 3;
   scalar |= inv_row_2_scale(mtx + 6) << 6;
   return scalar;
+}
+
+uint8_t dmpGetGravity(float *g, Quaternion *q) {
+  g[0] = 2 * (q -> x * q -> z - q -> w * q -> y);
+  g[1] = 2 * (q -> w * q -> x + q -> y * q -> z);
+  g[2] = q -> w * q -> w - q -> x * q -> x - q -> y * q -> y + q -> z * q -> z;
+  return 0;
+}
+
+uint8_t dmpGetLinearAccel(short *realAccel, short *Accel, float *gravity) {
+  // get rid of the gravity component (+1g = +8192 in standard DMP FIFO packet, sensitivity is 2g)
+  realAccel[0] = Accel[0] - gravity[0] * 8192;
+  realAccel[1] = Accel[1] - gravity[1] * 8192;
+  realAccel[2] = Accel[2] - gravity[2] * 8192;
+  return 0;
 }
 
 double temperature;
@@ -133,13 +154,6 @@ bool mpuSetup() {
         Serial.println("mpu_set_sensors complete.");
       }
 
-      if (mpu_configure_fifo(INV_XYZ_GYRO | INV_XYZ_ACCEL) != 0) {
-        Serial.println("Disable FIFO.");
-        return false;
-      } else {
-        Serial.println("mpu_configure_fifo complete.");
-      }
-
       if (mpu_set_sample_rate(MPU_RATE) != 0) {
         Serial.println("mpu_set_sample_rate() failed");
         return false;
@@ -168,11 +182,18 @@ bool mpuSetup() {
         Serial.println("mpu_set_gyro_fsr complete.");
       }
 
-      if (mpu_set_accel_fsr(Accel_16G) != 0 ) {
+      if (mpu_set_accel_fsr(Accel_2G) != 0 ) {
         Serial.println("Failure set Accel scale.");
         return false;
       } else {
-        Serial.println("mpu_set_gyro_fsr complete.");
+        Serial.println("mpu_set_Accel_fsr complete.");
+      }
+
+      if (mpu_configure_fifo(INV_XYZ_GYRO | INV_XYZ_ACCEL) != 0) {
+        Serial.println("Disable FIFO.");
+        return false;
+      } else {
+        Serial.println("mpu_configure_fifo complete.");
       }
     }
 
@@ -201,7 +222,14 @@ bool mpuSetup() {
         Serial.println("dmp_set_orientation complete.");
       }
 
-      if ( dmp_enable_feature(DMP_FEATURE_6X_LP_QUAT | DMP_FEATURE_SEND_CAL_GYRO | DMP_FEATURE_GYRO_CAL) != 0 ) {
+      if (mpu_set_dmp_state(DMP_ON) != 0 ) {
+        Serial.println("Stop DMP.");
+        return false;
+      } else {
+        Serial.println("mpu_set_dmp_state complete.");
+      }
+
+      if ( dmp_enable_feature(DMP_FEATURE_6X_LP_QUAT | DMP_FEATURE_SEND_RAW_ACCEL | DMP_FEATURE_SEND_CAL_GYRO | DMP_FEATURE_GYRO_CAL) != 0 ) {
         Serial.println("Disable DMP features.");
         return false;
       } else {
@@ -215,12 +243,19 @@ bool mpuSetup() {
         Serial.println("dmp_set_fifo_rate complete.");
       }
 
-      if (mpu_set_dmp_state(DMP_ON) != 0 ) {
-        Serial.println("Stop DMP.");
-        return false;
-      } else {
-        Serial.println("mpu_set_dmp_state complete.");
+      if (mpu_reset_fifo() != 0) {
+        printf("Failed to reset fifo!\n");
+        return -1;
       }
+
+      printf("Checking... ");
+      bool r;
+      do {
+        delay(1000 / DMP_RATE); //dmp will habve 4 (5-1) packets based on the fifo_rate
+        r = dmp_read_fifo(gyro, accel, quat, &sensor_timestamp, &sensors, &more);
+      } while (r != 0 || more < 5); //packtets!!!
+      printf("Done.\n");
+
     }
 
     //BMP setting
@@ -242,6 +277,7 @@ bool mpuSetup() {
         Serial.println("bmp setOversampling complete.");
       }
     }
+
     return true;
   }
 }
@@ -262,7 +298,7 @@ void setup() {
   if (mpuSetup()) {
     Serial.println("Completed all setting !!");
     completeInit = true;
-  }else{
+  } else {
     Serial.println("Failure setting !!");
     mpuSetup();
   }
@@ -270,12 +306,6 @@ void setup() {
 
 void loop() {
   if (completeInit) {
-
-    short gyro[3], accel[3], sensors;
-    unsigned char more = 0;
-    long quat[4];
-    unsigned long sensor_timestamp;
-
     //DMP update
     do {
       int success = dmp_read_fifo(gyro, accel, quat, &sensor_timestamp, &sensors, &more);
@@ -288,14 +318,31 @@ void loop() {
       }
     } while (more > 1);
 
-    // Send
-    if (Serial.available() > 0) {
-      String outputBuffer = String(q.x * 100000) + ',' +  // Convert the value to an ASCII string.
-                            String(q.y * 100000) + ',' +
-                            String(q.z * 100000) + ',' +
-                            String(q.w * 100000) + '\n';     // Add the new line character.;
+    // Send Quaternion
+//    if (Serial.available() > 0) {
+//      String outputBuffer = String(q.x * 100000) + ',' +  // Convert the value to an ASCII string.
+//                            String(q.y * 100000) + ',' +
+//                            String(q.z * 100000) + ',' +
+//                            String(q.w * 100000) + ',' +
+//                            String(gyro[0] * 100000) + ',' +
+//                            String(gyro[1] * 100000) + ',' +
+//                            String(gyro[2] * 100000) + ',' +
+//                            String(a[0] * 100000) + ',' +
+//                            String(a[1] * 100000) + ',' +
+//                            String(a[2] * 100000) + '\n';     // Add the new line character.;
+//
+//      Serial.write(outputBuffer.c_str(), outputBuffer.length());
+//    }
 
-      Serial.write(outputBuffer.c_str(), outputBuffer.length());
-    }
+
+    //Send LinearAccel
+    dmpGetGravity(gravity, &q);
+    dmpGetLinearAccel(realAccel, accel, gravity);
+
+    String outputBuffer = String(realAccel[0] ) + ',' +
+                          String(realAccel[1] ) + ',' +
+                          String(realAccel[2] ) + '\n';     // Add the new line character.;
+
+    Serial.write(outputBuffer.c_str(), outputBuffer.length());
   }
 }
