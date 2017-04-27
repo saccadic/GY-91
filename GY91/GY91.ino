@@ -1,14 +1,14 @@
-#define EMPL_TARGET_ATMEGA328
-
 #include <Wire.h>
 #include <I2Cdev.h>
 #include "helper_3dmath.h"
+#include "quaternionFilters.h"
 
 extern "C" {
 #include "inv_mpu.h"
 #include "inv_mpu_dmp_motion_driver.h"
 }
 
+//Sensor options
 #define GYRO_250DPS  250
 #define GYRO_500DPS  500
 #define GYRO_1000DPS 1000
@@ -18,17 +18,16 @@ extern "C" {
 #define Accel_8G 8
 #define Accel_16G 16
 
-/* Filter configurations. */
 enum lpf_e {
-  INV_FILTER_256HZ_NOLPF2 = 0,
-  INV_FILTER_188HZ,
-  INV_FILTER_98HZ,
-  INV_FILTER_42HZ,
-  INV_FILTER_20HZ,
-  INV_FILTER_10HZ,
-  INV_FILTER_5HZ,
-  INV_FILTER_2100HZ_NOLPF,
-  NUM_FILTER
+	INV_FILTER_256HZ_NOLPF2 = 0,
+	INV_FILTER_188HZ,
+	INV_FILTER_98HZ,
+	INV_FILTER_42HZ,
+	INV_FILTER_20HZ,
+	INV_FILTER_10HZ,
+	INV_FILTER_5HZ,
+	INV_FILTER_2100HZ_NOLPF,
+	NUM_FILTER
 };
 
 #define POWER_ON 1
@@ -39,304 +38,447 @@ enum lpf_e {
 #define DMP_ON 1
 #define DMP_OFF 0
 
-Quaternion q;
+//Setting options
+#define SERIAL_SPEED 230400
 
-#include "BMP280.h"
-BMP280  bmp;
-#define BMP_OVERSAMPLING 4
-#define P0 1013.25
+//Option
+const int GyroScale = GYRO_2000DPS;
+const int AccelScale = Accel_2G;
+const int lpf_rate = INV_FILTER_188HZ;
 
+//Update mode
+enum {
+	DMP,		//Digital Motion Processor
+	MADGWICK,	//MadgwickQuaternionUpdate
+	MAHONY,		//MahonyQuaternionUpdate
+};
+int processEngine = DMP;
+
+enum {
+	IDOLE,
+	RAWDATA,
+	Euler_ANGLE,
+	PYR_ANGLE,
+	QUATERNION,
+};
+int updateMode = QUATERNION;
+
+//FIFO
+int fifoResult;
+long unsigned int sensor_timestamp;
 short sensors;
-short gyro[3], accel[3], realAccel[3];
-unsigned char more = 0;
-long quat[4];
-long sensor_timestamp;
+unsigned char fifoCount = 0;
 
-float gravity[3];
+//Raw data
+short gyro[3];
+short accel[3];
+short commpass[3];
+long quat[4];
+
+//Mathematics data
+Quaternion quaternion;
+Quaternion Temp_quaternion;
+VectorFloat angle;
+VectorFloat tempAngle;
+
+//Quaternion filter
+float GyroMeasError = PI * (40.0f / 180.0f);		// gyroscope measurement error in rads/s (start at 40 deg/s)
+float GyroMeasDrift = PI * (0.0f / 180.0f);			// gyroscope measurement drift in rad/s/s (start at 0.0 deg/s/s)
+float beta = sqrt(3.0f / 4.0f) * GyroMeasError;		// compute beta
+float zeta = sqrt(3.0f / 4.0f) * GyroMeasDrift;		// compute zeta, the other free parameter in the Madgwick scheme usually set to a small or zero value
+float Kp = 2.0f * 5.0f;								// these are the free parameters in the Mahony filter and fusion scheme, Kp for proportional feedback, Ki for integral
+float Ki = 0.0f;
+uint32_t delt_t = 0;
+float deltat = 0.0f;
+uint32_t lastUpdate = 0, firstUpdate = 0;			// used to calculate integration interval
+uint32_t Now = 0;									// used to calculate integration interval
+float eInt[3] = { 0.0f, 0.0f, 0.0f };				// vector to hold integral error for Mahony method
+
+#define wrap_180(x) (x < -180 ? x+360 : (x > 180 ? x - 360: x))
+
+float RadToDeg(float x) { return x * (180 / PI); }
 
 unsigned short inv_row_2_scale(const signed char *row)
 {
-  unsigned short b;
+	unsigned short b;
 
-  if (row[0] > 0)
-    b = 0;
-  else if (row[0] < 0)
-    b = 4;
-  else if (row[1] > 0)
-    b = 1;
-  else if (row[1] < 0)
-    b = 5;
-  else if (row[2] > 0)
-    b = 2;
-  else if (row[2] < 0)
-    b = 6;
-  else
-    b = 7;      // error
-  return b;
+	if (row[0] > 0)
+		b = 0;
+	else if (row[0] < 0)
+		b = 4;
+	else if (row[1] > 0)
+		b = 1;
+	else if (row[1] < 0)
+		b = 5;
+	else if (row[2] > 0)
+		b = 2;
+	else if (row[2] < 0)
+		b = 6;
+	else
+		b = 7;      // error
+	return b;
 }
 
 unsigned short inv_orientation_matrix_to_scalar(const signed char *mtx)
 {
-  unsigned short scalar;
-  /*
-     XYZ  010_001_000 Identity Matrix
-     XZY  001_010_000
-     YXZ  010_000_001
-     YZX  000_010_001
-     ZXY  001_000_010
-     ZYX  000_001_010
-  */
-  scalar = inv_row_2_scale(mtx);
-  scalar |= inv_row_2_scale(mtx + 3) << 3;
-  scalar |= inv_row_2_scale(mtx + 6) << 6;
-  return scalar;
+	unsigned short scalar;
+	/*	XYZ  010_001_000 Identity Matrix
+		XZY  001_010_000
+		YXZ  010_000_001
+		YZX  000_010_001
+		ZXY  001_000_010
+		ZYX  000_001_010				*/
+	scalar = inv_row_2_scale(mtx);
+	scalar |= inv_row_2_scale(mtx + 3) << 3;
+	scalar |= inv_row_2_scale(mtx + 6) << 6;
+	return scalar;
 }
 
-uint8_t dmpGetGravity(float *g, Quaternion *q) {
-  g[0] = 2 * (q -> x * q -> z - q -> w * q -> y);
-  g[1] = 2 * (q -> w * q -> x + q -> y * q -> z);
-  g[2] = q -> w * q -> w - q -> x * q -> x - q -> y * q -> y + q -> z * q -> z;
-  return 0;
+uint8_t GetGravity(VectorFloat *v, Quaternion *q) {
+	v->x = 2 * (q->x*q->z - q->w*q->y);
+	v->y = 2 * (q->w*q->x + q->y*q->z);
+	v->z = q->w*q->w - q->x*q->x - q->y*q->y + q->z*q->z;
+	return 0;
 }
 
-uint8_t dmpGetLinearAccel(short *realAccel, short *Accel, float *gravity) {
-  // get rid of the gravity component (+1g = +8192 in standard DMP FIFO packet, sensitivity is 2g)
-  realAccel[0] = Accel[0] - gravity[0] * 8192;
-  realAccel[1] = Accel[1] - gravity[1] * 8192;
-  realAccel[2] = Accel[2] - gravity[2] * 8192;
-  return 0;
+uint8_t GetYawPitchRoll(VectorFloat *ypr, Quaternion *q, VectorFloat *gravity) {
+	// yaw: (about Z axis)
+	ypr->z = atan2(2 * q->x*q->y - 2 * q->w*q->z, 2 * q->w*q->w + 2 * q->x*q->x - 1);
+	// pitch: (nose up/down, about Y axis)
+	ypr->y = atan(gravity->x / sqrt(gravity->y*gravity->y + gravity->z*gravity->z));
+	// roll: (tilt left/right, about X axis)
+	ypr->x = atan(gravity->y / sqrt(gravity->x*gravity->x + gravity->z*gravity->z));
+	return 0;
 }
 
-double temperature;
-double pressure;
-double atm;
-double altitude;
-
-void updateBMP_DATA()
+void GetEulerAngle(VectorFloat *angle, Quaternion* q)
 {
-  double T, P;
-  char result = bmp.startMeasurment();
+	double ysqr = q->y * q->y;
 
-  if (result != 0) {
-    delay(result);
-    result = bmp.getTemperatureAndPressure(T, P);
-    if (result != 0)
-    {
-      temperature = T;
-      pressure    = P;
-      atm         = P / P0;
-      altitude    = bmp.altitude(P, P0);
-    }
-    else {
-      Serial.println("Error.");
-    }
-  }
-  else {
-    Serial.println("Error.");
-  }
+	// roll (x-axis rotation)
+	double t0 = +2.0 * (q->w * q->x + q->y * q->z);
+	double t1 = +1.0 - 2.0 * (q->x * q->x + ysqr);
+	angle->x = atan2(t0, t1);
+
+	// pitch (y-axis rotation)
+	double t2 = +2.0 * (q->w * q->y - q->z * q->x);
+	t2 = t2 > 1.0 ? 1.0 : t2;
+	t2 = t2 < -1.0 ? -1.0 : t2;
+	angle->y = asin(t2);
+
+	// yaw (z-axis rotation)
+	double t3 = +2.0 * (q->w * q->z + q->x * q->y);
+	double t4 = +1.0 - 2.0 * (ysqr + q->z * q->z);
+	angle->z = atan2(t3, t4);
 }
 
-bool mpuSetup() {
-  if (mpu_init(NULL) != 0 ) {
-    Serial.print("mpu_init failed!");
-    return false;
-  } else {
-    //MPU setting
-    {
-      Serial.println("****************************");
-      Serial.println("****************************");
-      Serial.println("Start Init mpu.");
+int InitMPU9250() {
 
-      if (mpu_set_sensors(INV_XYZ_GYRO | INV_XYZ_ACCEL | INV_XYZ_COMPASS) != 0) {
-        Serial.println("mpu_set_sensors failed!");
-        return false;
-      } else {
-        Serial.println("mpu_set_sensors complete.");
-      }
+	Serial.println("-----MPU-----");
 
-      if (mpu_set_sample_rate(MPU_RATE) != 0) {
-        Serial.println("mpu_set_sample_rate() failed");
-        return false;
-      } else {
-        Serial.println("mpu_set_sample_rate complete.");
-      }
+	if (mpu_init(NULL) != 0)
+	{
+		Serial.println("mpu_init failed!");
+		return -1;
+	}
+	else
+	{
+		Serial.println("Initialize sensor");
 
-      if (mpu_set_compass_sample_rate(MAG_RATE) != 0) {
-        Serial.println("mpu_set_compass_sample_rate() failed");
-        return false;
-      } else {
-        Serial.println("mpu_set_compass_sample_rate complete.");
-      }
+		//Select using sensor
+		if (mpu_set_sensors(INV_XYZ_GYRO | INV_XYZ_ACCEL | INV_XYZ_COMPASS) != 0) {
+			Serial.println("mpu_set_sensors failed!");
+			return -1;
+		}
+		else {
+			Serial.println("Activate gyro, accel and compass sensor.");
+		}
 
-      if (mpu_set_lpf(INV_FILTER_188HZ) != 0) {
-        Serial.println("mpu_set_lpf() failed");
-        return false;
-      } else {
-        Serial.println("mpu_set_lpf complete.");
-      }
+		//Set Scale
+		if (mpu_set_gyro_fsr(GyroScale) != 0) {
+			Serial.println("Failure set gyro scale.");
+			return -1;
+		}
+		else {
+			Serial.println("Set gyro scale : " + String(GyroScale) + "DPS");
+		}
+		if (mpu_set_accel_fsr(AccelScale) != 0) {
+			Serial.println("Failure set Accel scale.");
+			return -1;
+		}
+		else {
+			Serial.println("Set accel scale : " + String(AccelScale) + "G");
+		}
 
-      if (mpu_set_gyro_fsr(GYRO_2000DPS) != 0 ) {
-        Serial.println("Failure set gyro scale.");
-        return false;
-      } else {
-        Serial.println("mpu_set_gyro_fsr complete.");
-      }
+		////Set Update rate
+		if (mpu_set_sample_rate(MPU_RATE) != 0) {
+			Serial.println("mpu_set_sample_rate() failed");
+			return -1;
+		}
+		else {
+			Serial.println("Set MPU sample rate : " + String(MPU_RATE) + "hz");
+		}
 
-      if (mpu_set_accel_fsr(Accel_2G) != 0 ) {
-        Serial.println("Failure set Accel scale.");
-        return false;
-      } else {
-        Serial.println("mpu_set_Accel_fsr complete.");
-      }
+		if (mpu_set_compass_sample_rate(MAG_RATE) != 0) {
+			Serial.println("mpu_set_compass_sample_rate() failed");
+			return -1;
+		}
+		else {
+			Serial.println("Set compass sample rate : " + String(MAG_RATE) + "hz");
+		}
 
-      if (mpu_configure_fifo(INV_XYZ_GYRO | INV_XYZ_ACCEL) != 0) {
-        Serial.println("Disable FIFO.");
-        return false;
-      } else {
-        Serial.println("mpu_configure_fifo complete.");
-      }
-    }
+		////Set Filter
+		if (mpu_set_lpf(lpf_rate) != 0) {
+			Serial.println("mpu_set_lpf() failed");
+			return -1;
+		}
+		else {
+			int ipfRate;
 
-    //Dmp setting
-    {
-      Serial.println("****************************");
-      Serial.println("****************************");
-      Serial.println("Start init DMP.");
-      if ( dmp_load_motion_driver_firmware() != 0 ) {
-        Serial.println("Failure load motion driver >> ");
-        return false;
-      } else {
-        Serial.println("Load motion driver.");
-      }
+			if (lpf_rate >= 188)
+				ipfRate = 188;
+			else if (lpf_rate >= 98)
+				ipfRate = 98;
+			else if (lpf_rate >= 42)
+				ipfRate = 42;
+			else if (lpf_rate >= 20)
+				ipfRate = 20;
+			else if (lpf_rate >= 10)
+				ipfRate = 10;
+			else
+				ipfRate = 5;
 
-      signed char gyro_orientation[9] = {
-        1, 0, 0,
-        0, 1, 0,
-        0, 0, 1
-      };
+			Serial.println("Set lpf rate : " + String(ipfRate) + "hz");
+		}
 
-      if (dmp_set_orientation(inv_orientation_matrix_to_scalar(gyro_orientation)) != 0) {
-        Serial.println("dmp_set_orientation() failed");
-        return false;
-      } else {
-        Serial.println("dmp_set_orientation complete.");
-      }
+		//FIFO setting
+		if (mpu_configure_fifo(INV_XYZ_GYRO | INV_XYZ_ACCEL) != 0) {
+			printf("Failed to initialize MPU fifo!\n");
+			return -1;
+		}
+		else {
+			Serial.println("Active fifo gyro, accel sensor.");
+		}
 
-      if (mpu_set_dmp_state(DMP_ON) != 0 ) {
-        Serial.println("Stop DMP.");
-        return false;
-      } else {
-        Serial.println("mpu_set_dmp_state complete.");
-      }
+		// verify connection
+		unsigned char devStatus;
+		Serial.println("Powering up MPU...");
+		mpu_get_power_state(&devStatus);
+		if (devStatus)
+			Serial.println("> MPU6050 connection successful\n");
+		else
+			Serial.println("> MPU6050 connection failed %u\n");
 
-      if ( dmp_enable_feature(DMP_FEATURE_6X_LP_QUAT | DMP_FEATURE_SEND_RAW_ACCEL | DMP_FEATURE_SEND_CAL_GYRO | DMP_FEATURE_GYRO_CAL) != 0 ) {
-        Serial.println("Disable DMP features.");
-        return false;
-      } else {
-        Serial.println("dmp_enable_feature complete.");
-      }
+		//DMP Setup
+		Serial.println("-----DMP------");
 
-      if (dmp_set_fifo_rate(DMP_RATE) != 0) {
-        Serial.println("\ndmp_set_fifo_rate() failed\n");
-        return false;
-      } else {
-        Serial.println("dmp_set_fifo_rate complete.");
-      }
+		if (dmp_load_motion_driver_firmware() != 0) {
+			Serial.println("Failure load motion driver.");
+			return -1;
+		}
+		else {
+			Serial.println("Load motion driver.");
+		}
 
-      if (mpu_reset_fifo() != 0) {
-        printf("Failed to reset fifo!\n");
-        return -1;
-      }
+		if (mpu_set_dmp_state(DMP_ON) != 0) {
+			Serial.println("Stop DMP.");
+			return -1;
+		}
+		else {
+			Serial.println("> Digital Motion Processor active.\n");
+		}
 
-      printf("Checking... ");
-      bool r;
-      do {
-        delay(1000 / DMP_RATE); //dmp will habve 4 (5-1) packets based on the fifo_rate
-        r = dmp_read_fifo(gyro, accel, quat, &sensor_timestamp, &sensors, &more);
-      } while (r != 0 || more < 5); //packtets!!!
-      printf("Done.\n");
+		signed char gyro_orientation[9] = {
+			1, 0, 0,
+			0, 1, 0,
+			0, 0, 1
+		};
 
-    }
+		if (dmp_set_orientation(inv_orientation_matrix_to_scalar(gyro_orientation)) != 0) {
+			Serial.println("dmp_set_orientation() failed");
+			return -1;
+		}
+		else {
+			Serial.println("dmp_set_orientation complete.");
+		}
 
-    //BMP setting
-    {
-      Serial.println("****************************");
-      Serial.println("****************************");
-      Serial.println("Start init BMP280.");
-      if (bmp.begin() == 0) {
-        Serial.println("Error bmp begin()");
-        return false;
-      } else {
-        Serial.println("bmp begin complete.");
-      }
+		if (dmp_enable_feature(DMP_FEATURE_6X_LP_QUAT | DMP_FEATURE_SEND_RAW_ACCEL | DMP_FEATURE_SEND_CAL_GYRO | DMP_FEATURE_GYRO_CAL) != 0) {
+			Serial.println("Failure DMP features.");
+			return -1;
+		}
+		else {
+			Serial.println("Configuring DMP setting.");
+		}
 
-      if (bmp.setOversampling(BMP_OVERSAMPLING) == 0) {
-        Serial.println("Error bmp setOversampling()");
-        return false;
-      } else {
-        Serial.println("bmp setOversampling complete.");
-      }
-    }
+		if (dmp_set_fifo_rate(DMP_RATE) != 0) {
+			Serial.println("Failure set fifo rate.");
+			return -1;
+		}
+		else {
+			Serial.println("Set DMP rate : " + String(DMP_RATE) + "hz");
+		}
 
-    return true;
-  }
+		if (mpu_reset_fifo() != 0) {
+			printf("Failed mpu_reset_fifo!\n");
+			return -1;
+		}
+		else {
+			Serial.println("Reset fifo");
+		}
+
+		Serial.println("-----TEST------");
+		Serial.print("Checking...");
+		do {
+			delay(100);  //dmp will habve 4 (5-1) packets based on the fifo_rate
+			fifoResult = dmp_read_fifo(gyro, accel, quat, &sensor_timestamp, &sensors, &fifoCount);
+			Serial.print(".");
+		} while (fifoResult != 0 || fifoCount < 5);
+		Serial.println("\nMPU9250 ready !!\n");
+	}
 }
-
-bool completeInit = false;
 
 void setup() {
-  // put your setup code here, to run once:
-  Wire.begin();
-
-  //  Serial.begin(38400);
-  Serial.begin(230400);
-  //while (!Serial);
-
-  Serial.println();
-  Serial.println(F("Initializing MPU..."));
-
-  if (mpuSetup()) {
-    Serial.println("Completed all setting !!");
-    completeInit = true;
-  } else {
-    Serial.println("Failure setting !!");
-    mpuSetup();
-  }
+	// put your setup code here, to run once:
+	Wire.begin();
+	Serial.begin(SERIAL_SPEED);
+	Serial.println("\nInitializing MPU...");
+	InitMPU9250();
 }
 
 void loop() {
-  if (completeInit) {
-    //DMP update
-    do {
-      int success = dmp_read_fifo(gyro, accel, quat, &sensor_timestamp, &sensors, &more);
+	//Command
+	if (Serial.available() > 0) {
+		char inputchar = Serial.read();
+		switch (inputchar) {
+		case 'o':
+			tempAngle = angle;
+			break;
+		}
+	}
 
-      if ((success == 0)) {
-        q = Quaternion( (float)(quat[0]) / 1073741824.f,
-                        (float)(quat[1]) / 1073741824.f,
-                        (float)(quat[2]) / 1073741824.f,
-                        (float)(quat[3]) / 1073741824.f);
-      }
-    } while (more > 1);
+	//Update data
+	//TODO dalay
 
-    // Send Quaternion
-    if (Serial.available() > 0) {
-      String outputBuffer = String(q.x * 100000) + ',' +  // Convert the value to an ASCII string.
-                            String(q.y * 100000) + ',' +
-                            String(q.z * 100000) + ',' +
-                            String(q.w * 100000) + '\n';  // Add the new line character.;
+	if (processEngine != RAWDATA) {
+		switch (processEngine) {
+		case DMP:
+		{
+			do { dmp_read_fifo(gyro, accel, quat, &sensor_timestamp, &sensors, &fifoCount); } while (fifoCount > 1);
 
-      Serial.write(outputBuffer.c_str(), outputBuffer.length());
-    }
+			Quaternion rawQuaternion = Quaternion(
+				(float)(quat[0] / 1073741824.f), //long to float
+				(float)(quat[1] / 1073741824.f),
+				(float)(quat[2] / 1073741824.f),
+				(float)(quat[3] / 1073741824.f)
+			);
 
+			//Filter
+			float a = 9.0f;
+			quaternion.w = a * rawQuaternion.w - (1.0f - a) * Temp_quaternion.w;
+			quaternion.x = a * rawQuaternion.x - (1.0f - a) * Temp_quaternion.x;
+			quaternion.y = a * rawQuaternion.y - (1.0f - a) * Temp_quaternion.y;
+			quaternion.z = a * rawQuaternion.z - (1.0f - a) * Temp_quaternion.z;
+			Temp_quaternion = rawQuaternion;
+		}
+		break;
+		case MADGWICK:
+		{
 
-    //Send LinearAccel
-//    dmpGetGravity(gravity, &q);
-//    dmpGetLinearAccel(realAccel, accel, gravity);
-//
-//    String outputBuffer = String(realAccel[0] * 100000) + ',' +
-//                          String(realAccel[1] * 100000) + ',' +
-//                          String(realAccel[2] * 100000) + '\n';     // Add the new line character.;
-//
-//    Serial.write(outputBuffer.c_str(), outputBuffer.length());
-  }
+			Now = micros();
+			deltat = ((Now - lastUpdate) / 1000000.0f); // set integration time by time elapsed since last filter update
+			lastUpdate = Now;
+
+			mpu_get_gyro_reg(gyro, &sensor_timestamp);
+			mpu_get_accel_reg(accel, &sensor_timestamp);
+			mpu_get_compass_reg(commpass, &sensor_timestamp);
+
+			MadgwickQuaternionUpdate(&quaternion, beta, zeta, deltat, accel[0], accel[1], accel[2], gyro[0] * PI / 180.0f, gyro[1] * PI / 180.0f, gyro[2] * PI / 180.0f, commpass[1], commpass[0], commpass[2]);
+
+		}
+		break;
+		case MAHONY:
+		{
+
+			Now = micros();
+			deltat = ((Now - lastUpdate) / 1000000.0f); // set integration time by time elapsed since last filter update
+			lastUpdate = Now;
+
+			mpu_get_gyro_reg(gyro, &sensor_timestamp);
+			mpu_get_accel_reg(accel, &sensor_timestamp);
+			mpu_get_compass_reg(commpass, &sensor_timestamp);
+
+			MahonyQuaternionUpdate(&quaternion, eInt, Ki, Kp, deltat, accel[0], accel[1], accel[2], gyro[0] * PI / 180.0f, gyro[1] * PI / 180.0f, gyro[2] * PI / 180.0f, commpass[1], commpass[0], commpass[2]);
+		}
+		break;
+		}
+	}
+
+	//Output
+	//if (Serial.available() > 0) {
+	switch (updateMode) {
+	case RAWDATA:
+	{
+		mpu_get_gyro_reg(gyro, &sensor_timestamp);
+		mpu_get_accel_reg(accel, &sensor_timestamp);
+		mpu_get_compass_reg(commpass, &sensor_timestamp);
+
+		String outputBuffer;
+		outputBuffer += "Gyro : ";
+		outputBuffer += String(gyro[0]) + "," + String(gyro[1]) + "," + String(gyro[2]);
+		outputBuffer += ", Accel : ";
+		outputBuffer += String(accel[0]) + "," + String(accel[1]) + "," + String(accel[2]);
+		outputBuffer += ", Compass : ";
+		outputBuffer += String(commpass[0]) + "," + String(commpass[1]) + "," + String(commpass[2]);
+		outputBuffer += "\n";
+
+		Serial.write(outputBuffer.c_str(), outputBuffer.length());
+	}
+	break;
+	case Euler_ANGLE:
+	{
+		GetEulerAngle(&angle, &quaternion);
+
+		//Serial.print(sensor_timestamp);
+		//Serial.print(",");
+		Serial.print(RadToDeg(angle.x - tempAngle.x));
+		Serial.print(",");
+		Serial.print(RadToDeg(angle.y - tempAngle.y));
+		Serial.print(",");
+		Serial.println(RadToDeg(angle.z - tempAngle.z));
+	}
+	break;
+	case PYR_ANGLE:
+	{
+		VectorFloat gravity, calcYPR;
+		GetGravity(&gravity, &quaternion);
+		GetYawPitchRoll(&angle, &quaternion, &gravity);
+		calcYPR.x = RadToDeg(angle.x - tempAngle.x);
+		calcYPR.y = RadToDeg(angle.y - tempAngle.y);
+		calcYPR.z = RadToDeg(angle.z - tempAngle.z);
+		calcYPR.x = wrap_180(calcYPR.x);
+		calcYPR.y *= -1.0;
+
+		//Serial.print(sensor_timestamp);
+		//Serial.print(",");
+		Serial.print(RadToDeg(angle.x - tempAngle.x));
+		Serial.print(",");
+		Serial.print(RadToDeg(angle.y - tempAngle.y));
+		Serial.print(",");
+		Serial.println(RadToDeg(angle.z - tempAngle.z));
+	}
+	break;
+	case QUATERNION:
+	{
+		String outputBuffer =
+			String(quaternion.x * 100000.f) + ',' +  // Convert the value to an ASCII string.
+			String(quaternion.y * 100000.f) + ',' +
+			String(quaternion.z * 100000.f) + ',' +
+			String(quaternion.w * 100000.f) + '\n';  // Add the new line character.;
+
+		Serial.write(outputBuffer.c_str(), outputBuffer.length());
+	}
+	break;
+	}
+	//}
 }
+
