@@ -10,6 +10,22 @@ extern "C" {
 #include "inv_mpu_dmp_motion_driver.h"
 }
 
+//Adress
+#define MPU9250_ADDRESS				0x68  // MPU9250 address when ADO = 1
+#define AK8963_ADDRESS				0x0C  
+#define MPU9250_XG_OFFSET_H			0x13  // User-defined trim values for gyroscope
+#define MPU9250_XG_OFFSET_L			0x14
+#define MPU9250_YG_OFFSET_H			0x15
+#define MPU9250_YG_OFFSET_L			0x16
+#define MPU9250_ZG_OFFSET_H			0x17
+#define MPU9250_ZG_OFFSET_L			0x18
+#define MPU9250_XA_OFFSET_H			0x77
+#define MPU9250_XA_OFFSET_L			0x78
+#define MPU9250_YA_OFFSET_H			0x7A
+#define MPU9250_YA_OFFSET_L			0x7B
+#define MPU9250_ZA_OFFSET_H			0x7D
+#define MPU9250_ZA_OFFSET_L			0x7E
+
 //Sensor options
 #define GYRO_250DPS  250
 #define GYRO_500DPS  500
@@ -52,14 +68,14 @@ const int filterNum = 0.6f; //0.0f ` 1.0f
 //##########################################
 
 //Update mode
-int CalibrationMode = -1;
+int CalibrationMode = 0;
 
 enum {
 	DMP,		//Digital Motion Processor
 	MADGWICK,	//MadgwickQuaternionUpdate
 	MAHONY,		//MahonyQuaternionUpdate
 };
-int processEngine = MAHONY;
+int processEngine = MADGWICK;
 
 enum {
 	IDOLE,
@@ -68,7 +84,7 @@ enum {
 	PYR_ANGLE,
 	QUATERNION,
 };
-int updateMode = QUATERNION;
+int updateMode = IDOLE;
 
 //FIFO
 int fifoResult;
@@ -81,6 +97,11 @@ short gyro[3];
 short accel[3];
 short commpass[3];
 long quat[4];
+
+//Calibration data
+float gyroBias[3]  = { 0, 0, 0 };
+float accelBias[3] = { 0, 0, 0 };
+float magBias[3]   = { 0, 0, 0 };
 
 //Mathematics data
 Quaternion rawQuaternion;
@@ -102,6 +123,27 @@ uint32_t lastUpdate = 0, firstUpdate = 0;			// used to calculate integration int
 uint32_t Now = 0;									// used to calculate integration interval
 float eInt[3] = { 0.0f, 0.0f, 0.0f };				// vector to hold integral error for Mahony method
 
+void writeByte(uint8_t address, uint8_t subAddress, uint8_t data)
+{
+	Wire.beginTransmission(address);  // Initialize the Tx buffer
+	Wire.write(subAddress);           // Put slave register address in Tx buffer
+	Wire.write(data);                 // Put data in Tx buffer
+	Wire.endTransmission();           // Send the Tx buffer
+}
+
+void readBytes(uint8_t address, uint8_t subAddress, uint8_t count, uint8_t * dest)
+{
+	Wire.beginTransmission(address);   // Initialize the Tx buffer
+	Wire.write(subAddress);            // Put slave register address in Tx buffer
+	Wire.endTransmission(false);  // Send the Tx buffer, but send a restart to keep connection alive
+									   //	Wire.endTransmission(false);       // Send the Tx buffer, but send a restart to keep connection alive
+	uint8_t i = 0;
+	//        Wire.requestFrom(address, count);  // Read bytes from slave register address
+	Wire.requestFrom(address, (size_t)count);  // Read bytes from slave register address
+	while (Wire.available()) {
+		dest[i++] = Wire.read();
+	}         // Put read results in the Rx buffer
+}
 
 unsigned short inv_row_2_scale(const signed char *row)
 {
@@ -123,7 +165,6 @@ unsigned short inv_row_2_scale(const signed char *row)
 		b = 7;      // error
 	return b;
 }
-
 unsigned short inv_orientation_matrix_to_scalar(const signed char *mtx)
 {
 	unsigned short scalar;
@@ -153,7 +194,6 @@ void GetYawPitchRoll(VectorFloat *ypr, Quaternion *q) {
 	ypr->y *= 180.0f / PI; //- 8.35f; // Declination at Danville, Morioka is 8 degrees 35 minutes on 2017-04-29;
 	ypr->x *= 180.0f / PI;
 }
-
 void GetEulerAngle(VectorFloat *angle, Quaternion* q)
 {
 	double ysqr = q->y * q->y;
@@ -177,6 +217,102 @@ void GetEulerAngle(VectorFloat *angle, Quaternion* q)
 	angle->x *= 180.0f / PI;
 	angle->y *= 180.0f / PI;
 	angle->z *= 180.0f / PI;
+}
+
+void accelgyrocalMPU9250(float * dest1, float * dest2) {
+	int BufferSize = 10000;
+	unsigned char data[12]; // data array to hold accelerometer and gyro x, y, z, data
+	short accel_temp[3] = { 0, 0, 0 }, gyro_temp[3]  = { 0, 0, 0 };
+	long  gyro_bias[3]  = { 0, 0, 0 }, accel_bias[3] = { 0, 0, 0 };
+
+	VectorFloat g, a;
+	for (int i = 0; i < BufferSize; i++) {
+
+		mpu_get_gyro_reg(gyro, &sensor_timestamp);
+		gyro_temp[0] = gyro[0];
+		gyro_temp[1] = gyro[1];
+		gyro_temp[2] = gyro[2];
+
+		mpu_get_accel_reg(accel, &sensor_timestamp);
+		accel_temp[0] = accel[0];
+		accel_temp[1] = accel[1];
+		accel_temp[2] = accel[2];
+
+		gyro_bias[0] += (long)gyro_temp[0];
+		gyro_bias[1] += (long)gyro_temp[1];
+		gyro_bias[2] += (long)gyro_temp[2];
+
+		accel_bias[0] += (long)accel_temp[0];
+		accel_bias[1] += (long)accel_temp[1];
+		accel_bias[2] += (long)accel_temp[2];
+
+		Serial.print(".");
+	}
+
+	Serial.println("");
+
+	gyro_bias[0]  /= (long)BufferSize;
+	gyro_bias[1]  /= (long)BufferSize;
+	gyro_bias[2]  /= (long)BufferSize;
+	accel_bias[0] /= (long)BufferSize;
+	accel_bias[1] /= (long)BufferSize;
+	accel_bias[2] /= (long)BufferSize;
+
+	Serial.print("gx_ave : ");	Serial.println(gyro_bias[0]);
+	Serial.print("gy_ave : ");	Serial.println(gyro_bias[1]);
+	Serial.print("gz_ave : ");	Serial.println(gyro_bias[2]);
+	Serial.print("ax_ave : ");	Serial.println(accel_bias[0]);
+	Serial.print("ay_ave : ");	Serial.println(accel_bias[1]);
+	Serial.print("az_ave : ");	Serial.println(accel_bias[2]);
+
+	long gyrosensitivity = 131;
+	long accelsensitivity = 16384;
+
+	if (accel_bias[2] > 0L)
+		accel_bias[2] -= accelsensitivity;
+	else
+		accel_bias[2] += accelsensitivity;
+
+	data[0] = (-gyro_bias[0] / 4 >> 8) & 0xFF; // Divide by 4 to get 32.9 LSB per deg/s to conform to expected bias input format
+	data[1] = (-gyro_bias[0] / 4) & 0xFF; // Biases are additive, so change sign on calculated average gyro biases
+	data[2] = (-gyro_bias[1] / 4 >> 8) & 0xFF;
+	data[3] = (-gyro_bias[1] / 4) & 0xFF;
+	data[4] = (-gyro_bias[2] / 4 >> 8) & 0xFF;
+	data[5] = (-gyro_bias[2] / 4) & 0xFF;
+
+	writeByte(MPU9250_ADDRESS, MPU9250_XG_OFFSET_H, data[0]);
+	writeByte(MPU9250_ADDRESS, MPU9250_XG_OFFSET_L, data[1]);
+	writeByte(MPU9250_ADDRESS, MPU9250_YG_OFFSET_H, data[2]);
+	writeByte(MPU9250_ADDRESS, MPU9250_YG_OFFSET_L, data[3]);
+	writeByte(MPU9250_ADDRESS, MPU9250_ZG_OFFSET_H, data[4]);
+	writeByte(MPU9250_ADDRESS, MPU9250_ZG_OFFSET_L, data[5]);
+
+	dest1[0] = (float)gyro_bias[0] / (float)gyrosensitivity;
+	dest1[1] = (float)gyro_bias[1] / (float)gyrosensitivity;
+	dest1[2] = (float)gyro_bias[2] / (float)gyrosensitivity;
+
+	long accel_bias_reg[3] = { 0, 0, 0 }; // A place to hold the factory accelerometer trim biases
+	readBytes(MPU9250_ADDRESS, MPU9250_XA_OFFSET_H, 2, &data[0]); // Read factory accelerometer trim values
+	accel_bias_reg[0] = (long)(((short)data[0] << 8) | data[1]);
+	readBytes(MPU9250_ADDRESS, MPU9250_YA_OFFSET_H, 2, &data[0]);
+	accel_bias_reg[1] = (long)(((short)data[0] << 8) | data[1]);
+	readBytes(MPU9250_ADDRESS, MPU9250_ZA_OFFSET_H, 2, &data[0]);
+	accel_bias_reg[2] = (long)(((short)data[0] << 8) | data[1]);
+
+	accel_bias_reg[0] -= (accel_bias[0] / 8); // Subtract calculated averaged accelerometer bias scaled to 2048 LSB/g (16 g full scale)
+	accel_bias_reg[1] -= (accel_bias[1] / 8);
+	accel_bias_reg[2] -= (accel_bias[2] / 8);
+
+	dest2[0] = (float)accel_bias[0] / (float)accelsensitivity;
+	dest2[1] = (float)accel_bias[1] / (float)accelsensitivity;
+	dest2[2] = (float)accel_bias[2] / (float)accelsensitivity;
+
+	Serial.print("gyro_bias  : ");	Serial.println(dest1[0]);
+	Serial.print("gyro_bias  : ");	Serial.println(dest1[1]);
+	Serial.print("gyro_bias  : ");	Serial.println(dest1[2]);
+	Serial.print("accel_bias : ");	Serial.println(dest2[0]);
+	Serial.print("accel_bias : ");	Serial.println(dest2[1]);
+	Serial.print("accel_bias : ");	Serial.println(dest2[2]);
 }
 
 int InitMPU9250_Debug() {
@@ -421,52 +557,16 @@ void setup() {
 	Serial.begin(SERIAL_SPEED);
 	Serial.println("\nInitializing MPU...");
 	if (InitMPU9250()) {
-		Serial.println("mpu init failed!");
+		Serial.println("mpu init !");
 	}
 }
 
 void loop() {
 	if (CalibrationMode == 0)
 	{
-		//int BufferSize = 10000;
+		accelgyrocalMPU9250(gyroBias, accelBias);
 
-		//float gyroTemp[3] = { 0,0,0 };
-		//float accelTemp[3] = { 0,0,0 };
-
-		//for (int i = 0; i < BufferSize; i++) {
-		//	mpu_get_gyro_reg(gyro, &sensor_timestamp);
-		//	mpu_get_accel_reg(accel, &sensor_timestamp);
-
-		//	gyroTemp[0] += (float)gyro[0];
-		//	gyroTemp[1] += (float)gyro[1];
-		//	gyroTemp[2] += (float)gyro[2];
-
-		//	accelTemp[0] += (float)accel[0];
-		//	accelTemp[1] += (float)accel[1];
-		//	accelTemp[2] += (float)accel[2];
-
-		//	delay(10);
-
-		//	Serial.print(".");
-		//}
-		//Serial.println("");
-
-		//gyroTemp[0] /= (float)BufferSize;
-		//gyroTemp[1] /= (float)BufferSize;
-		//gyroTemp[2] /= (float)BufferSize;
-
-		//accelTemp[0] /= (float)BufferSize;
-		//accelTemp[1] /= (float)BufferSize;
-		//accelTemp[2] /= (float)BufferSize;
-
-		//Serial.print("gx_ave : ");	Serial.println(gyroTemp[0], 1);
-		//Serial.print("gy_ave : ");	Serial.println(gyroTemp[1], 1);
-		//Serial.print("gz_ave : ");	Serial.println(gyroTemp[2], 1);
-		//Serial.print("ax_ave : ");	Serial.println(accelTemp[0], 1);
-		//Serial.print("ay_ave : ");	Serial.println(accelTemp[1], 1);
-		//Serial.print("az_ave : ");	Serial.println(accelTemp[2], 1);
-
-		//CalibrationMode = -1;
+		CalibrationMode = -1;
 	}
 	else
 	{
