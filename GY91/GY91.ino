@@ -3,6 +3,8 @@
 #include "helper_3dmath.h"
 #include "quaternionFilters.h"
 
+#define DEBUG
+
 extern "C" {
 #include "inv_mpu.h"
 #include "inv_mpu_dmp_motion_driver.h"
@@ -33,7 +35,7 @@ enum lpf_e {
 #define POWER_ON 1
 #define POWER_OFF 2
 #define MPU_RATE 1000
-#define DMP_RATE 200
+#define DMP_RATE 200 //MAX:200
 #define MAG_RATE 100
 #define DMP_ON 1
 #define DMP_OFF 0
@@ -41,18 +43,23 @@ enum lpf_e {
 //Setting options
 #define SERIAL_SPEED 230400
 
+//##########################################
 //Option
 const int GyroScale = GYRO_2000DPS;
 const int AccelScale = Accel_2G;
 const int lpf_rate = INV_FILTER_188HZ;
+const int filterNum = 0.6f; //0.0f ～ 1.0f
+//##########################################
 
 //Update mode
+int CalibrationMode = -1;
+
 enum {
 	DMP,		//Digital Motion Processor
 	MADGWICK,	//MadgwickQuaternionUpdate
 	MAHONY,		//MahonyQuaternionUpdate
 };
-int processEngine = DMP;
+int processEngine = MAHONY;
 
 enum {
 	IDOLE,
@@ -76,6 +83,7 @@ short commpass[3];
 long quat[4];
 
 //Mathematics data
+Quaternion rawQuaternion;
 Quaternion quaternion;
 Quaternion Temp_quaternion;
 VectorFloat angle;
@@ -94,9 +102,6 @@ uint32_t lastUpdate = 0, firstUpdate = 0;			// used to calculate integration int
 uint32_t Now = 0;									// used to calculate integration interval
 float eInt[3] = { 0.0f, 0.0f, 0.0f };				// vector to hold integral error for Mahony method
 
-#define wrap_180(x) (x < -180 ? x+360 : (x > 180 ? x - 360: x))
-
-float RadToDeg(float x) { return x * (180 / PI); }
 
 unsigned short inv_row_2_scale(const signed char *row)
 {
@@ -134,21 +139,19 @@ unsigned short inv_orientation_matrix_to_scalar(const signed char *mtx)
 	return scalar;
 }
 
-uint8_t GetGravity(VectorFloat *v, Quaternion *q) {
-	v->x = 2 * (q->x*q->z - q->w*q->y);
-	v->y = 2 * (q->w*q->x + q->y*q->z);
-	v->z = q->w*q->w - q->x*q->x - q->y*q->y + q->z*q->z;
-	return 0;
-}
-
-uint8_t GetYawPitchRoll(VectorFloat *ypr, Quaternion *q, VectorFloat *gravity) {
-	// yaw: (about Z axis)
-	ypr->z = atan2(2 * q->x*q->y - 2 * q->w*q->z, 2 * q->w*q->w + 2 * q->x*q->x - 1);
-	// pitch: (nose up/down, about Y axis)
-	ypr->y = atan(gravity->x / sqrt(gravity->y*gravity->y + gravity->z*gravity->z));
+void GetYawPitchRoll(VectorFloat *ypr, Quaternion *q) {
 	// roll: (tilt left/right, about X axis)
-	ypr->x = atan(gravity->y / sqrt(gravity->x*gravity->x + gravity->z*gravity->z));
-	return 0;
+	ypr->x = atan2(2.0f * (q->x * q->y + q->w * q->z), q->w * q->w + q->x * q->x - q->y * q->y - q->z * q->z);
+	// pitch: (nose up/down, about Y axis)
+	ypr->y = atan2(2.0f * (q->y * q->z + q->w * q->x), q->w * q->w - q->x * q->x - q->y * q->y + q->z * q->z);
+	// yaw: (about Z axis)
+	ypr->z = asin((2.0f * (q->w * q->y)) - (2.0f * (q->x * q->z)));
+
+	//http://vldb.gsi.go.jp/sokuchi/geomag/menu_04/index.html
+
+	ypr->z *= 180.0f / PI;
+	ypr->y *= 180.0f / PI; //- 8.35f; // Declination at Danville, Morioka is 8 degrees 35 minutes on 2017-04-29;
+	ypr->x *= 180.0f / PI;
 }
 
 void GetEulerAngle(VectorFloat *angle, Quaternion* q)
@@ -170,9 +173,13 @@ void GetEulerAngle(VectorFloat *angle, Quaternion* q)
 	double t3 = +2.0 * (q->w * q->z + q->x * q->y);
 	double t4 = +1.0 - 2.0 * (ysqr + q->z * q->z);
 	angle->z = atan2(t3, t4);
+
+	angle->x *= 180.0f / PI;
+	angle->y *= 180.0f / PI;
+	angle->z *= 180.0f / PI;
 }
 
-int InitMPU9250() {
+int InitMPU9250_Debug() {
 
 	Serial.println("-----MPU-----");
 
@@ -333,7 +340,78 @@ int InitMPU9250() {
 			fifoResult = dmp_read_fifo(gyro, accel, quat, &sensor_timestamp, &sensors, &fifoCount);
 			Serial.print(".");
 		} while (fifoResult != 0 || fifoCount < 5);
-		Serial.println("\nMPU9250 ready !!\n");
+
+		Serial.println("\nMPU9250 Factory calibration data:");
+		long factoryGyroData[3], factoryAccelData[3];
+		mpu_run_self_test(factoryGyroData, factoryAccelData);
+		Serial.print("gx : ");	Serial.print(factoryGyroData[0], 1);	Serial.println("%");
+		Serial.print("gy : ");	Serial.print(factoryGyroData[1], 1);	Serial.println("%");
+		Serial.print("gz : ");	Serial.print(factoryGyroData[2], 1);	Serial.println("%");
+		Serial.print("ax : ");	Serial.print(factoryAccelData[0], 1);	Serial.println("%");
+		Serial.print("ay : ");	Serial.print(factoryAccelData[1], 1);	Serial.println("%");
+		Serial.print("az : ");	Serial.print(factoryAccelData[2], 1);	Serial.println("%");
+
+		Serial.println("\n-----MPU9250-ready-!!-----\n");
+	}
+}
+int InitMPU9250() {
+	if (mpu_init(NULL) != 0)
+	{
+		return -1;
+	}
+	else
+	{
+		//Select using sensor
+		if (mpu_set_sensors(INV_XYZ_GYRO | INV_XYZ_ACCEL | INV_XYZ_COMPASS) != 0)
+			return -1;
+
+		//Set Scale
+		if (mpu_set_gyro_fsr(GyroScale) != 0)
+			return -1;
+
+		if (mpu_set_accel_fsr(AccelScale) != 0)
+			return -1;
+
+		////Set Update rate
+		if (mpu_set_sample_rate(MPU_RATE) != 0)
+			return -1;
+
+		if (mpu_set_compass_sample_rate(MAG_RATE) != 0)
+			return -1;
+
+		////Set Filter
+		if (mpu_set_lpf(lpf_rate) != 0)
+			return -1;
+
+		//FIFO setting
+		if (mpu_configure_fifo(INV_XYZ_GYRO | INV_XYZ_ACCEL) != 0)
+			return -1;
+
+
+		if (dmp_load_motion_driver_firmware() != 0)
+			return -1;
+
+		if (mpu_set_dmp_state(DMP_ON) != 0)
+			return -1;
+
+
+		signed char gyro_orientation[9] = {
+			1, 0, 0,
+			0, 1, 0,
+			0, 0, 1
+		};
+
+		if (dmp_set_orientation(inv_orientation_matrix_to_scalar(gyro_orientation)) != 0)
+			return -1;
+
+		if (dmp_enable_feature(DMP_FEATURE_6X_LP_QUAT | DMP_FEATURE_SEND_RAW_ACCEL | DMP_FEATURE_SEND_CAL_GYRO | DMP_FEATURE_GYRO_CAL) != 0)
+			return -1;
+
+		if (dmp_set_fifo_rate(DMP_RATE) != 0)
+			return -1;
+
+		if (mpu_reset_fifo() != 0)
+			return -1;
 	}
 }
 
@@ -342,143 +420,249 @@ void setup() {
 	Wire.begin();
 	Serial.begin(SERIAL_SPEED);
 	Serial.println("\nInitializing MPU...");
-	InitMPU9250();
+	if (InitMPU9250()) {
+		Serial.println("mpu init failed!");
+	}
 }
 
 void loop() {
-	//Command
-	if (Serial.available() > 0) {
-		char inputchar = Serial.read();
-		switch (inputchar) {
-		case 'o':
-			tempAngle = angle;
-			break;
-		}
+	if (CalibrationMode == 0)
+	{
+		//int BufferSize = 10000;
+
+		//float gyroTemp[3] = { 0,0,0 };
+		//float accelTemp[3] = { 0,0,0 };
+
+		//for (int i = 0; i < BufferSize; i++) {
+		//	mpu_get_gyro_reg(gyro, &sensor_timestamp);
+		//	mpu_get_accel_reg(accel, &sensor_timestamp);
+
+		//	gyroTemp[0] += (float)gyro[0];
+		//	gyroTemp[1] += (float)gyro[1];
+		//	gyroTemp[2] += (float)gyro[2];
+
+		//	accelTemp[0] += (float)accel[0];
+		//	accelTemp[1] += (float)accel[1];
+		//	accelTemp[2] += (float)accel[2];
+
+		//	delay(10);
+
+		//	Serial.print(".");
+		//}
+		//Serial.println("");
+
+		//gyroTemp[0] /= (float)BufferSize;
+		//gyroTemp[1] /= (float)BufferSize;
+		//gyroTemp[2] /= (float)BufferSize;
+
+		//accelTemp[0] /= (float)BufferSize;
+		//accelTemp[1] /= (float)BufferSize;
+		//accelTemp[2] /= (float)BufferSize;
+
+		//Serial.print("gx_ave : ");	Serial.println(gyroTemp[0], 1);
+		//Serial.print("gy_ave : ");	Serial.println(gyroTemp[1], 1);
+		//Serial.print("gz_ave : ");	Serial.println(gyroTemp[2], 1);
+		//Serial.print("ax_ave : ");	Serial.println(accelTemp[0], 1);
+		//Serial.print("ay_ave : ");	Serial.println(accelTemp[1], 1);
+		//Serial.print("az_ave : ");	Serial.println(accelTemp[2], 1);
+
+		//CalibrationMode = -1;
 	}
+	else
+	{
+		//Command
+		if (Serial.available() > 0) {
+			char inputchar = Serial.read();
+			switch (inputchar) {
+			case 'o':
+				tempAngle = angle;
+				break;
+			}
+		}
 
-	//Update data
-	//TODO dalay
-
-	if (processEngine != RAWDATA) {
+		//Update data
 		switch (processEngine) {
 		case DMP:
 		{
 			do { dmp_read_fifo(gyro, accel, quat, &sensor_timestamp, &sensors, &fifoCount); } while (fifoCount > 1);
 
-			Quaternion rawQuaternion = Quaternion(
+			rawQuaternion = Quaternion(
 				(float)(quat[0] / 1073741824.f), //long to float
 				(float)(quat[1] / 1073741824.f),
 				(float)(quat[2] / 1073741824.f),
 				(float)(quat[3] / 1073741824.f)
 			);
-
-			//Filter
-			float a = 9.0f;
-			quaternion.w = a * rawQuaternion.w - (1.0f - a) * Temp_quaternion.w;
-			quaternion.x = a * rawQuaternion.x - (1.0f - a) * Temp_quaternion.x;
-			quaternion.y = a * rawQuaternion.y - (1.0f - a) * Temp_quaternion.y;
-			quaternion.z = a * rawQuaternion.z - (1.0f - a) * Temp_quaternion.z;
-			Temp_quaternion = rawQuaternion;
 		}
 		break;
 		case MADGWICK:
 		{
+			float ax, ay, az; //加速度
+			float gx, gy, gz; //角速度
+			float mx, my, mz; //地磁気
 
 			Now = micros();
 			deltat = ((Now - lastUpdate) / 1000000.0f); // set integration time by time elapsed since last filter update
 			lastUpdate = Now;
 
 			mpu_get_gyro_reg(gyro, &sensor_timestamp);
+			gx = gyro[0] * 2000.0f / 32768.0f;
+			gy = gyro[1] * 2000.0f / 32768.0f;
+			gz = gyro[2] * 2000.0f / 32768.0f;
+
 			mpu_get_accel_reg(accel, &sensor_timestamp);
+			ax = accel[0] * 2.0f / 32768.0f;
+			ay = accel[1] * 2.0f / 32768.0f;
+			az = accel[2] * 2.0f / 32768.0f;
+
 			mpu_get_compass_reg(commpass, &sensor_timestamp);
+			mx = commpass[0] * 10.0f * 1229.0f / 4096.0f + 18.0f;
+			my = commpass[1] * 10.0f * 1229.0f / 4096.0f + 70.0f;
+			mz = commpass[2] * 10.0f * 1229.0f / 4096.0f + 270.0f;
 
-			MadgwickQuaternionUpdate(&quaternion, beta, zeta, deltat, accel[0], accel[1], accel[2], gyro[0] * PI / 180.0f, gyro[1] * PI / 180.0f, gyro[2] * PI / 180.0f, commpass[1], commpass[0], commpass[2]);
-
+			MadgwickQuaternionUpdate(
+				&rawQuaternion,
+				beta,
+				zeta,
+				deltat,
+				ax,
+				ay,
+				az,
+				gx * PI / 180.0f,
+				gy * PI / 180.0f,
+				gz * PI / 180.0f,
+				my,
+				mx,
+				mz
+			);
 		}
 		break;
 		case MAHONY:
 		{
+			float ax, ay, az; //加速度
+			float gx, gy, gz; //角速度
+			float mx, my, mz; //地磁気
 
 			Now = micros();
 			deltat = ((Now - lastUpdate) / 1000000.0f); // set integration time by time elapsed since last filter update
 			lastUpdate = Now;
 
 			mpu_get_gyro_reg(gyro, &sensor_timestamp);
-			mpu_get_accel_reg(accel, &sensor_timestamp);
-			mpu_get_compass_reg(commpass, &sensor_timestamp);
+			gx = gyro[0] * 2000.0f / 32768.0f;
+			gy = gyro[1] * 2000.0f / 32768.0f;
+			gz = gyro[2] * 2000.0f / 32768.0f;
 
-			MahonyQuaternionUpdate(&quaternion, eInt, Ki, Kp, deltat, accel[0], accel[1], accel[2], gyro[0] * PI / 180.0f, gyro[1] * PI / 180.0f, gyro[2] * PI / 180.0f, commpass[1], commpass[0], commpass[2]);
+			mpu_get_accel_reg(accel, &sensor_timestamp);
+			ax = accel[0] * 2.0f / 32768.0f;
+			ay = accel[1] * 2.0f / 32768.0f;
+			az = accel[2] * 2.0f / 32768.0f;
+
+			mpu_get_compass_reg(commpass, &sensor_timestamp);
+			mx = commpass[0] * 10.0f * 1229.0f / 4096.0f + 18.0f;
+			my = commpass[1] * 10.0f * 1229.0f / 4096.0f + 70.0f;
+			mz = commpass[2] * 10.0f * 1229.0f / 4096.0f + 270.0f;
+
+			//-ax, ay, az, gx*pi/180.0f, -gy*pi/180.0f, -gz*pi/180.0f,  my,  -mx, mz
+			MahonyQuaternionUpdate(
+				&rawQuaternion,
+				eInt,
+				Ki,
+				Kp,
+				deltat,
+				ax,
+				ay,
+				az,
+				gx * PI / 180.0f,
+				gy * PI / 180.0f,
+				gz * PI / 180.0f,
+				my,
+				mx,
+				mz
+			);
+		}
+		break;
+		}
+
+		//Filter 相関フィルタ
+		float a = filterNum;
+		if (a > 1.0f) { a = 1.0f; }
+		if (a < 0.0f) { a = 0.0f; }
+		quaternion.w = a * rawQuaternion.w - (1.0f - a) * Temp_quaternion.w;
+		quaternion.x = a * rawQuaternion.x - (1.0f - a) * Temp_quaternion.x;
+		quaternion.y = a * rawQuaternion.y - (1.0f - a) * Temp_quaternion.y;
+		quaternion.z = a * rawQuaternion.z - (1.0f - a) * Temp_quaternion.z;
+		Temp_quaternion = rawQuaternion;
+
+		//Output
+		switch (updateMode) {
+		case RAWDATA:
+		{
+			float ax, ay, az; //加速度
+			float gx, gy, gz; //角速度
+			float mx, my, mz; //地磁気
+
+			mpu_get_gyro_reg(gyro, &sensor_timestamp);
+			gx = gyro[0] * 2000.0f / 32768.0f;
+			gy = gyro[1] * 2000.0f / 32768.0f;
+			gz = gyro[2] * 2000.0f / 32768.0f;
+
+			mpu_get_accel_reg(accel, &sensor_timestamp);
+			ax = accel[0] * 2.0f / 32768.0f;
+			ay = accel[1] * 2.0f / 32768.0f;
+			az = accel[2] * 2.0f / 32768.0f;
+
+			mpu_get_compass_reg(commpass, &sensor_timestamp);
+			mx = commpass[0] * 10.0f * 1229.0f / 4096.0f + 18.0f;
+			my = commpass[1] * 10.0f * 1229.0f / 4096.0f + 70.0f;
+			mz = commpass[2] * 10.0f * 1229.0f / 4096.0f + 270.0f;
+
+			String outputBuffer;
+			outputBuffer += "Gyro : ";
+			outputBuffer += String(gx) + "," + String(gy) + "," + String(gz);
+			outputBuffer += ", Accel : ";
+			outputBuffer += String(ax) + "," + String(ay) + "," + String(az);
+			outputBuffer += ", Compass : ";
+			outputBuffer += String(mx) + "," + String(my) + "," + String(mz);
+			outputBuffer += "\n";
+
+			Serial.write(outputBuffer.c_str(), outputBuffer.length());
+		}
+		break;
+		case Euler_ANGLE:
+		{
+			GetEulerAngle(&angle, &quaternion);
+
+			String outputBuffer =
+				String(angle.x - tempAngle.x) + ',' +
+				String(angle.y - tempAngle.y) + ',' +
+				String(angle.z - tempAngle.z) + '\n';
+
+			Serial.write(outputBuffer.c_str(), outputBuffer.length());
+		}
+		break;
+		case PYR_ANGLE:
+		{
+			GetYawPitchRoll(&angle, &quaternion);
+
+			String outputBuffer =
+				String(angle.x - tempAngle.x) + ',' +  //Roll
+				String(angle.y - tempAngle.y) + ',' +  //Pitch
+				String(angle.z - tempAngle.z) + '\n';  //Yaw
+
+			Serial.write(outputBuffer.c_str(), outputBuffer.length());
+		}
+		break;
+		case QUATERNION:
+		{
+			String outputBuffer =
+				String(quaternion.w * 100000.f) + ',' +  //W
+				String(quaternion.x * 100000.f) + ',' +  //X
+				String(quaternion.y * 100000.f) + ',' +  //Y
+				String(quaternion.z * 100000.f) + '\n';  //Z
+
+			Serial.write(outputBuffer.c_str(), outputBuffer.length());
 		}
 		break;
 		}
 	}
-
-	//Output
-	//if (Serial.available() > 0) {
-	switch (updateMode) {
-	case RAWDATA:
-	{
-		mpu_get_gyro_reg(gyro, &sensor_timestamp);
-		mpu_get_accel_reg(accel, &sensor_timestamp);
-		mpu_get_compass_reg(commpass, &sensor_timestamp);
-
-		String outputBuffer;
-		outputBuffer += "Gyro : ";
-		outputBuffer += String(gyro[0]) + "," + String(gyro[1]) + "," + String(gyro[2]);
-		outputBuffer += ", Accel : ";
-		outputBuffer += String(accel[0]) + "," + String(accel[1]) + "," + String(accel[2]);
-		outputBuffer += ", Compass : ";
-		outputBuffer += String(commpass[0]) + "," + String(commpass[1]) + "," + String(commpass[2]);
-		outputBuffer += "\n";
-
-		Serial.write(outputBuffer.c_str(), outputBuffer.length());
-	}
-	break;
-	case Euler_ANGLE:
-	{
-		GetEulerAngle(&angle, &quaternion);
-
-		//Serial.print(sensor_timestamp);
-		//Serial.print(",");
-		Serial.print(RadToDeg(angle.x - tempAngle.x));
-		Serial.print(",");
-		Serial.print(RadToDeg(angle.y - tempAngle.y));
-		Serial.print(",");
-		Serial.println(RadToDeg(angle.z - tempAngle.z));
-	}
-	break;
-	case PYR_ANGLE:
-	{
-		VectorFloat gravity, calcYPR;
-		GetGravity(&gravity, &quaternion);
-		GetYawPitchRoll(&angle, &quaternion, &gravity);
-		calcYPR.x = RadToDeg(angle.x - tempAngle.x);
-		calcYPR.y = RadToDeg(angle.y - tempAngle.y);
-		calcYPR.z = RadToDeg(angle.z - tempAngle.z);
-		calcYPR.x = wrap_180(calcYPR.x);
-		calcYPR.y *= -1.0;
-
-		//Serial.print(sensor_timestamp);
-		//Serial.print(",");
-		Serial.print(RadToDeg(angle.x - tempAngle.x));
-		Serial.print(",");
-		Serial.print(RadToDeg(angle.y - tempAngle.y));
-		Serial.print(",");
-		Serial.println(RadToDeg(angle.z - tempAngle.z));
-	}
-	break;
-	case QUATERNION:
-	{
-		String outputBuffer =
-			String(quaternion.x * 100000.f) + ',' +  // Convert the value to an ASCII string.
-			String(quaternion.y * 100000.f) + ',' +
-			String(quaternion.z * 100000.f) + ',' +
-			String(quaternion.w * 100000.f) + '\n';  // Add the new line character.;
-
-		Serial.write(outputBuffer.c_str(), outputBuffer.length());
-	}
-	break;
-	}
-	//}
 }
 
