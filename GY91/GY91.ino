@@ -2,6 +2,7 @@
 #include <I2Cdev.h>
 #include "helper_3dmath.h"
 #include "quaternionFilters.h"
+#include <EEPROM.h>
 
 extern "C" {
 #include "inv_mpu.h"
@@ -61,15 +62,17 @@ enum lpf_e {
 
 //##########################################
 //Option
-const int GyroScale     = GYRO_2000DPS;
-const int AccelScale    = Accel_2G;
-const int lpf_rate      = INV_FILTER_188HZ;
-	  int filterNum     = 0.9f; //0.0f ` 1.0fs
-const float magneticRes = 10.0f * 1229.0f / 4096.0f; // scale  milliGauss
+const int GyroScale						= GYRO_2000DPS;
+const int AccelScale					= Accel_2G;
+const int lpf_rate						= INV_FILTER_188HZ;
+int filterNum							= 0.9f; //0.0f ` 1.0fs
+const float magneticRes					= 10.0f * 1229.0f / 4096.0f; // scale  milliGauss
+const unsigned short gyrosensitivity	= 131;  // = 131 LSB/degrees/sec
+const unsigned short accelsensitivity	= 16384;// = 16384 LSB/g
 //##########################################
 
 //Update mode
-int CalibrationMode = 0;
+int CalibrationMode = -1;
 
 enum {
 	DMP,		//Digital Motion Processor
@@ -85,7 +88,7 @@ enum {
 	PYR_ANGLE,
 	QUATERNION,
 };
-int updateMode = QUATERNION;
+int updateMode = Euler_ANGLE;
 
 //FIFO
 int fifoResult;
@@ -100,10 +103,14 @@ short commpass[3];
 long quat[4];
 
 //Calibration data
-float destination[3] = { 0, 0, 0 };
-float gyroBias[3] = { 0, 0, 0 };
-float accelBias[3] = { 0, 0, 0 };
-float magBias[3] = { 0, 0, 0 };
+struct CalibrationData {
+	float destination[3]	= { 0, 0, 0 };
+	float gyroBias[3]		= { 0, 0, 0 };
+	float accelBias[3]		= { 0, 0, 0 };
+	float magBias[3]		= { 0, 0, 0 };
+};
+CalibrationData CalibrationSaveData;
+
 
 //Mathematics data
 Quaternion rawQuaternion;
@@ -219,7 +226,7 @@ void GetEulerAngle(VectorFloat *angle, Quaternion* q)
 }
 void accelgyrocalMPU9250(float * dest1, float * dest2) {
 	unsigned int BufferSize = 1000;
-	unsigned char data[12]; // data array to hold accelerometer and gyro x, y, z, data
+	uint8_t data[12]; // data array to hold accelerometer and gyro x, y, z, data
 
 	long  gyro_bias[3] = { 0, 0, 0 }, accel_bias[3] = { 0, 0, 0 };
 
@@ -273,9 +280,6 @@ void accelgyrocalMPU9250(float * dest1, float * dest2) {
 	Serial.print("ay_ave : ");	Serial.println(accel_bias[1]);
 	Serial.print("az_ave : ");	Serial.println(accel_bias[2]);
 
-	unsigned short gyrosensitivity = 131;  // = 131 LSB/degrees/sec
-	unsigned short accelsensitivity = 16384;// = 16384 LSB/g
-
 	if (accel_bias[2] > 0L)
 		accel_bias[2] -= (long)accelsensitivity;
 	else
@@ -319,9 +323,9 @@ void magcalMPU9250(float * magCalibration, float * dest1)
 {
 	long mag_bias[3] = { 0, 0, 0 };
 	short mag_max[3] = { -32767, -32767, -32767 }, mag_min[3] = { 32767, 32767, 32767 }, mag_temp[3] = { 0, 0, 0 };
-	
+
 	int update = 1;
-	
+
 	while (update) {
 		mpu_get_compass_reg(mag_temp, &sensor_timestamp);  // Read the mag data
 		for (int j = 0; j < 3; j++) {
@@ -353,7 +357,7 @@ void magcalMPU9250(float * magCalibration, float * dest1)
 	dest1[2] = (float)mag_bias[2] * magneticRes*magCalibration[2];
 }
 void GetCompassSelfTest(float * destination) {
-	unsigned char rawData[3];  // x/y/z gyro calibration data stored here
+	uint8_t rawData[3];  // x/y/z gyro calibration data stored here
 	writeByte(AK8963_ADDRESS, AK8963_CNTL, 0x00); // Power down magnetometer
 	delay(10);
 	writeByte(AK8963_ADDRESS, AK8963_CNTL, 0x0F); // Enter Fuse ROM access mode
@@ -371,6 +375,54 @@ void GetCompassSelfTest(float * destination) {
 	Serial.print("destination_x  : ");	Serial.println(destination[0]);
 	Serial.print("destination_y  : ");	Serial.println(destination[1]);
 	Serial.print("destination_z : ");	Serial.println(destination[2]);
+}
+void SaveCalibration(struct CalibrationData *calibrationData) {
+	Serial.println("Save saveCalibration");
+
+	byte* p = (byte*)calibrationData;
+	for (int j = 0; j < sizeof(CalibrationData); j++) {
+		EEPROM.write(j, *p); p++;
+		Serial.print(".");
+	}
+}
+void LoadCalibration(struct CalibrationData *calibrationData) {
+	Serial.println("Load saveCalibration");
+
+	byte* p2 = (byte*)calibrationData;
+	for (int j = 0; j < sizeof(CalibrationData); j++) {
+		byte b = EEPROM.read(j); *p2 = b; p2++;
+		Serial.print(".");
+	}
+
+	uint8_t data[6]; // data array to hold accelerometer and gyro x, y, z, data
+	long  gyro_bias[3] = { 0, 0, 0 };
+
+	gyro_bias[0] = calibrationData->gyroBias[0] * (float)gyrosensitivity;
+	gyro_bias[1] = calibrationData->gyroBias[1] * (float)gyrosensitivity;
+	gyro_bias[2] = calibrationData->gyroBias[2] * (float)gyrosensitivity;
+
+	data[0] = (-gyro_bias[0] / 4 >> 8) & 0xFF;	// Divide by 4 to get 32.9 LSB per deg/s to conform to expected bias input format
+	data[1] = (-gyro_bias[0] / 4) & 0xFF;		// Biases are additive, so change sign on calculated average gyro biases
+	data[2] = (-gyro_bias[1] / 4 >> 8) & 0xFF;
+	data[3] = (-gyro_bias[1] / 4) & 0xFF;
+	data[4] = (-gyro_bias[2] / 4 >> 8) & 0xFF;
+	data[5] = (-gyro_bias[2] / 4) & 0xFF;
+	writeByte(MPU9250_ADDRESS, MPU9250_XG_OFFSET_H, data[0]);
+	writeByte(MPU9250_ADDRESS, MPU9250_XG_OFFSET_L, data[1]);
+	writeByte(MPU9250_ADDRESS, MPU9250_YG_OFFSET_H, data[2]);
+	writeByte(MPU9250_ADDRESS, MPU9250_YG_OFFSET_L, data[3]);
+	writeByte(MPU9250_ADDRESS, MPU9250_ZG_OFFSET_H, data[4]);
+	writeByte(MPU9250_ADDRESS, MPU9250_ZG_OFFSET_L, data[5]);
+
+	Serial.print("gyro_bias    : ");	Serial.println(CalibrationSaveData.gyroBias[0]);
+	Serial.print("gyro_bias    : ");	Serial.println(CalibrationSaveData.gyroBias[1]);
+	Serial.print("gyro_bias    : ");	Serial.println(CalibrationSaveData.gyroBias[2]);
+	Serial.print("accel_bias   : ");	Serial.println(CalibrationSaveData.accelBias[0]);
+	Serial.print("accel_bias   : ");	Serial.println(CalibrationSaveData.accelBias[1]);
+	Serial.print("accel_bias   : ");	Serial.println(CalibrationSaveData.accelBias[2]);
+	Serial.print("Compass_bias : ");	Serial.println(CalibrationSaveData.magBias[0]);
+	Serial.print("Compass_bias : ");	Serial.println(CalibrationSaveData.magBias[1]);
+	Serial.print("Compass_bias : ");	Serial.println(CalibrationSaveData.magBias[2]);
 }
 int InitMPU9250_Debug() {
 
@@ -614,26 +666,27 @@ void setup() {
 	Serial.begin(SERIAL_SPEED);
 	Serial.println("\nInitializing MPU...");
 	if (InitMPU9250()) {
-		GetCompassSelfTest(destination);
 		Serial.println("mpu init !");
+		LoadCalibration(&CalibrationSaveData);
 	}
 }
 
 void loop() {
 	if (CalibrationMode == 0)
 	{
-		accelgyrocalMPU9250(gyroBias, accelBias);
-		magcalMPU9250(destination, magBias);
+		accelgyrocalMPU9250(CalibrationSaveData.gyroBias, CalibrationSaveData.accelBias);
+		GetCompassSelfTest(CalibrationSaveData.destination);
+		magcalMPU9250(CalibrationSaveData.destination, CalibrationSaveData.magBias);
 
-		Serial.print("gyro_bias    : ");	Serial.println(gyroBias[0]);
-		Serial.print("gyro_bias    : ");	Serial.println(gyroBias[1]);
-		Serial.print("gyro_bias    : ");	Serial.println(gyroBias[2]);
-		Serial.print("accel_bias   : ");	Serial.println(accelBias[0]);
-		Serial.print("accel_bias   : ");	Serial.println(accelBias[1]);
-		Serial.print("accel_bias   : ");	Serial.println(accelBias[2]);
-		Serial.print("Compass_bias : ");	Serial.println(magBias[0]);
-		Serial.print("Compass_bias : ");	Serial.println(magBias[1]);
-		Serial.print("Compass_bias : ");	Serial.println(magBias[2]);
+		Serial.print("gyro_bias    : ");	Serial.println(CalibrationSaveData.gyroBias[0]);
+		Serial.print("gyro_bias    : ");	Serial.println(CalibrationSaveData.gyroBias[1]);
+		Serial.print("gyro_bias    : ");	Serial.println(CalibrationSaveData.gyroBias[2]);
+		Serial.print("accel_bias   : ");	Serial.println(CalibrationSaveData.accelBias[0]);
+		Serial.print("accel_bias   : ");	Serial.println(CalibrationSaveData.accelBias[1]);
+		Serial.print("accel_bias   : ");	Serial.println(CalibrationSaveData.accelBias[2]);
+		Serial.print("Compass_bias : ");	Serial.println(CalibrationSaveData.magBias[0]);
+		Serial.print("Compass_bias : ");	Serial.println(CalibrationSaveData.magBias[1]);
+		Serial.print("Compass_bias : ");	Serial.println(CalibrationSaveData.magBias[2]);
 
 		CalibrationMode = -1;
 	}
@@ -650,7 +703,7 @@ void loop() {
 				CalibrationMode = 0;
 				break;
 			case 's':
-
+				SaveCalibration(&CalibrationSaveData);
 				break;
 			}
 		}
@@ -685,14 +738,14 @@ void loop() {
 			gz = (float)gyro[2] * (float)GyroScale / 32768.0f;
 
 			mpu_get_accel_reg(accel, &sensor_timestamp);
-			ax = ((float)accel[0] * (float)AccelScale - accelBias[0]) / 32768.0f;
-			ay = ((float)accel[1] * (float)AccelScale - accelBias[1]) / 32768.0f;
-			az = ((float)accel[2] * (float)AccelScale - accelBias[2]) / 32768.0f;
+			ax = ((float)accel[0] * (float)AccelScale - CalibrationSaveData.accelBias[0]) / 32768.0f;
+			ay = ((float)accel[1] * (float)AccelScale - CalibrationSaveData.accelBias[1]) / 32768.0f;
+			az = ((float)accel[2] * (float)AccelScale - CalibrationSaveData.accelBias[2]) / 32768.0f;
 
 			mpu_get_compass_reg(commpass, &sensor_timestamp);
-			mx = (float)commpass[0] * magneticRes * destination[0] - magBias[0];
-			my = (float)commpass[1] * magneticRes * destination[1] - magBias[1];
-			mz = (float)commpass[2] * magneticRes * destination[2] - magBias[2];
+			mx = (float)commpass[0] * magneticRes * CalibrationSaveData.destination[0] - CalibrationSaveData.magBias[0];
+			my = (float)commpass[1] * magneticRes * CalibrationSaveData.destination[1] - CalibrationSaveData.magBias[1];
+			mz = (float)commpass[2] * magneticRes * CalibrationSaveData.destination[2] - CalibrationSaveData.magBias[2];
 
 			MadgwickQuaternionUpdate(
 				&rawQuaternion,
@@ -727,14 +780,14 @@ void loop() {
 			gz = (float)gyro[2] * (float)GyroScale / 32768.0f;
 
 			mpu_get_accel_reg(accel, &sensor_timestamp);
-			ax = ((float)accel[0] * (float)AccelScale - accelBias[0]) / 32768.0f;
-			ay = ((float)accel[1] * (float)AccelScale - accelBias[1]) / 32768.0f;
-			az = ((float)accel[2] * (float)AccelScale - accelBias[2]) / 32768.0f;
+			ax = ((float)accel[0] * (float)AccelScale - CalibrationSaveData.accelBias[0]) / 32768.0f;
+			ay = ((float)accel[1] * (float)AccelScale - CalibrationSaveData.accelBias[1]) / 32768.0f;
+			az = ((float)accel[2] * (float)AccelScale - CalibrationSaveData.accelBias[2]) / 32768.0f;
 
 			mpu_get_compass_reg(commpass, &sensor_timestamp);
-			mx = (float)commpass[0] * magneticRes * destination[0] - magBias[0];
-			my = (float)commpass[1] * magneticRes * destination[1] - magBias[1];
-			mz = (float)commpass[2] * magneticRes * destination[2] - magBias[2];
+			mx = (float)commpass[0] * magneticRes * CalibrationSaveData.destination[0] - CalibrationSaveData.magBias[0];
+			my = (float)commpass[1] * magneticRes * CalibrationSaveData.destination[1] - CalibrationSaveData.magBias[1];
+			mz = (float)commpass[2] * magneticRes * CalibrationSaveData.destination[2] - CalibrationSaveData.magBias[2];
 
 			//-ax, ay, az, gx*pi/180.0f, -gy*pi/180.0f, -gz*pi/180.0f,  my,  -mx, mz
 			MahonyQuaternionUpdate(
