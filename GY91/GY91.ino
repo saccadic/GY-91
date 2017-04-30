@@ -3,8 +3,6 @@
 #include "helper_3dmath.h"
 #include "quaternionFilters.h"
 
-#define DEBUG
-
 extern "C" {
 #include "inv_mpu.h"
 #include "inv_mpu_dmp_motion_driver.h"
@@ -63,10 +61,10 @@ enum lpf_e {
 
 //##########################################
 //Option
-const int GyroScale = GYRO_2000DPS;
-const int AccelScale = Accel_2G;
-const int lpf_rate = INV_FILTER_188HZ;
-const int filterNum = 0.6f; //0.0f Å` 1.0fs
+const int GyroScale     = GYRO_2000DPS;
+const int AccelScale    = Accel_2G;
+const int lpf_rate      = INV_FILTER_188HZ;
+	  int filterNum     = 0.9f; //0.0f Å` 1.0fs
 const float magneticRes = 10.0f * 1229.0f / 4096.0f; // scale  milliGauss
 //##########################################
 
@@ -103,9 +101,9 @@ long quat[4];
 
 //Calibration data
 float destination[3] = { 0, 0, 0 };
-float gyroBias[3]    = { 0, 0, 0 };
-float accelBias[3]   = { 0, 0, 0 };
-float magBias[3]     = { 0, 0, 0 };
+float gyroBias[3] = { 0, 0, 0 };
+float accelBias[3] = { 0, 0, 0 };
+float magBias[3] = { 0, 0, 0 };
 
 //Mathematics data
 Quaternion rawQuaternion;
@@ -134,7 +132,6 @@ void writeByte(uint8_t address, uint8_t subAddress, uint8_t data)
 	Wire.write(data);                 // Put data in Tx buffer
 	Wire.endTransmission();           // Send the Tx buffer
 }
-
 void readBytes(uint8_t address, uint8_t subAddress, uint8_t count, uint8_t * dest)
 {
 	Wire.beginTransmission(address);   // Initialize the Tx buffer
@@ -148,7 +145,6 @@ void readBytes(uint8_t address, uint8_t subAddress, uint8_t count, uint8_t * des
 		dest[i++] = Wire.read();
 	}         // Put read results in the Rx buffer
 }
-
 unsigned short inv_row_2_scale(const signed char *row)
 {
 	unsigned short b;
@@ -183,7 +179,6 @@ unsigned short inv_orientation_matrix_to_scalar(const signed char *mtx)
 	scalar |= inv_row_2_scale(mtx + 6) << 6;
 	return scalar;
 }
-
 void GetYawPitchRoll(VectorFloat *ypr, Quaternion *q) {
 	// roll: (tilt left/right, about X axis)
 	ypr->x = atan2(2.0f * (q->x * q->y + q->w * q->z), q->w * q->w + q->x * q->x - q->y * q->y - q->z * q->z);
@@ -222,16 +217,15 @@ void GetEulerAngle(VectorFloat *angle, Quaternion* q)
 	angle->y *= 180.0f / PI;
 	angle->z *= 180.0f / PI;
 }
-
 void accelgyrocalMPU9250(float * dest1, float * dest2) {
 	unsigned int BufferSize = 1000;
 	unsigned char data[12]; // data array to hold accelerometer and gyro x, y, z, data
 
 	long  gyro_bias[3] = { 0, 0, 0 }, accel_bias[3] = { 0, 0, 0 };
 
-	VectorFloat g, a;
-	for (unsigned int i = 0; i < BufferSize; i++) {
-		unsigned short accel_temp[3] = { 0, 0, 0 }, gyro_temp[3] = { 0, 0, 0 };
+	int update = 1;
+	while (update) {
+		short accel_temp[3] = { 0, 0, 0 }, gyro_temp[3] = { 0, 0, 0 };
 
 		mpu_get_gyro_reg(gyro, &sensor_timestamp);
 		gyro_temp[0] = gyro[0];
@@ -252,13 +246,22 @@ void accelgyrocalMPU9250(float * dest1, float * dest2) {
 		accel_bias[2] += (long)accel_temp[2];
 
 		Serial.print(".");
+
+		if (Serial.available() > 0) {
+			char inputchar = Serial.read();
+			if (inputchar == 's')
+				update = 0;
+		}
+		else {
+			BufferSize++;
+		}
 	}
 
 	Serial.println("");
 
-	gyro_bias[0]  /= (long)BufferSize;
-	gyro_bias[1]  /= (long)BufferSize;
-	gyro_bias[2]  /= (long)BufferSize;
+	gyro_bias[0] /= (long)BufferSize;
+	gyro_bias[1] /= (long)BufferSize;
+	gyro_bias[2] /= (long)BufferSize;
 	accel_bias[0] /= (long)BufferSize;
 	accel_bias[1] /= (long)BufferSize;
 	accel_bias[2] /= (long)BufferSize;
@@ -270,27 +273,27 @@ void accelgyrocalMPU9250(float * dest1, float * dest2) {
 	Serial.print("ay_ave : ");	Serial.println(accel_bias[1]);
 	Serial.print("az_ave : ");	Serial.println(accel_bias[2]);
 
-	short gyrosensitivity  = 131;  // = 131 LSB/degrees/sec
-	short accelsensitivity = 16384;// = 16384 LSB/g
+	unsigned short gyrosensitivity = 131;  // = 131 LSB/degrees/sec
+	unsigned short accelsensitivity = 16384;// = 16384 LSB/g
 
 	if (accel_bias[2] > 0L)
-		accel_bias[2] -= accelsensitivity;
+		accel_bias[2] -= (long)accelsensitivity;
 	else
-		accel_bias[2] += accelsensitivity;
+		accel_bias[2] += (long)accelsensitivity;
 
-	data[0] = (-gyro_bias[0] / 4 >> 8) & 0xFF; // Divide by 4 to get 32.9 LSB per deg/s to conform to expected bias input format
-	data[1] = (-gyro_bias[0] / 4) & 0xFF; // Biases are additive, so change sign on calculated average gyro biases
+	data[0] = (-gyro_bias[0] / 4 >> 8) & 0xFF;	// Divide by 4 to get 32.9 LSB per deg/s to conform to expected bias input format
+	data[1] = (-gyro_bias[0] / 4) & 0xFF;		// Biases are additive, so change sign on calculated average gyro biases
 	data[2] = (-gyro_bias[1] / 4 >> 8) & 0xFF;
 	data[3] = (-gyro_bias[1] / 4) & 0xFF;
 	data[4] = (-gyro_bias[2] / 4 >> 8) & 0xFF;
 	data[5] = (-gyro_bias[2] / 4) & 0xFF;
 
-	//writeByte(MPU9250_ADDRESS, MPU9250_XG_OFFSET_H, data[0]);
-	//writeByte(MPU9250_ADDRESS, MPU9250_XG_OFFSET_L, data[1]);
-	//writeByte(MPU9250_ADDRESS, MPU9250_YG_OFFSET_H, data[2]);
-	//writeByte(MPU9250_ADDRESS, MPU9250_YG_OFFSET_L, data[3]);
-	//writeByte(MPU9250_ADDRESS, MPU9250_ZG_OFFSET_H, data[4]);
-	//writeByte(MPU9250_ADDRESS, MPU9250_ZG_OFFSET_L, data[5]);
+	writeByte(MPU9250_ADDRESS, MPU9250_XG_OFFSET_H, data[0]);
+	writeByte(MPU9250_ADDRESS, MPU9250_XG_OFFSET_L, data[1]);
+	writeByte(MPU9250_ADDRESS, MPU9250_YG_OFFSET_H, data[2]);
+	writeByte(MPU9250_ADDRESS, MPU9250_YG_OFFSET_L, data[3]);
+	writeByte(MPU9250_ADDRESS, MPU9250_ZG_OFFSET_H, data[4]);
+	writeByte(MPU9250_ADDRESS, MPU9250_ZG_OFFSET_L, data[5]);
 
 	dest1[0] = (float)gyro_bias[0] / (float)gyrosensitivity;
 	dest1[1] = (float)gyro_bias[1] / (float)gyrosensitivity;
@@ -314,10 +317,12 @@ void accelgyrocalMPU9250(float * dest1, float * dest2) {
 }
 void magcalMPU9250(float * magCalibration, float * dest1)
 {
-	unsigned int BufferSize = 100;
 	long mag_bias[3] = { 0, 0, 0 };
 	short mag_max[3] = { -32767, -32767, -32767 }, mag_min[3] = { 32767, 32767, 32767 }, mag_temp[3] = { 0, 0, 0 };
-	for (unsigned int i = 0; i < BufferSize; i++) {
+	
+	int update = 1;
+	
+	while (update) {
 		mpu_get_compass_reg(mag_temp, &sensor_timestamp);  // Read the mag data
 		for (int j = 0; j < 3; j++) {
 			if (mag_temp[j] > mag_max[j]) mag_max[j] = mag_temp[j];
@@ -329,6 +334,13 @@ void magcalMPU9250(float * magCalibration, float * dest1)
 		Serial.print("mag_min_y  : ");	Serial.println(mag_min[1]);
 		Serial.print("mag_max_z  : ");	Serial.println(mag_max[2]);
 		Serial.print("mag_min_z  : ");	Serial.println(mag_min[2]);
+
+		if (Serial.available() > 0) {
+			char inputchar = Serial.read();
+			if (inputchar == 's')
+				update = 0;
+		}
+
 		delay(135);  // at 8 Hz ODR, new mag data is available every 125 ms
 	}
 
@@ -634,6 +646,12 @@ void loop() {
 			case 'o':
 				tempAngle = angle;
 				break;
+			case 'c':
+				CalibrationMode = 0;
+				break;
+			case 's':
+
+				break;
 			}
 		}
 
@@ -661,21 +679,6 @@ void loop() {
 			deltat = ((Now - lastUpdate) / 1000000.0f); // set integration time by time elapsed since last filter update
 			lastUpdate = Now;
 
-			//mpu_get_gyro_reg(gyro, &sensor_timestamp);
-			//gx = (float)gyro[0] * (float)GyroScale / 32768.0f;
-			//gy = (float)gyro[1] * (float)GyroScale / 32768.0f;
-			//gz = (float)gyro[2] * (float)GyroScale / 32768.0f;
-
-			//mpu_get_accel_reg(accel, &sensor_timestamp);
-			//ax = ((float)accel[0] * (float)AccelScale - accelBias[0]) / 32768.0f;
-			//ay = ((float)accel[1] * (float)AccelScale - accelBias[1]) / 32768.0f;
-			//az = ((float)accel[2] * (float)AccelScale - accelBias[2]) / 32768.0f;
-
-			//mpu_get_compass_reg(commpass, &sensor_timestamp);
-			//mx = (float)commpass[0] * magneticRes * destination[0] - magBias[0];
-			//my = (float)commpass[1] * magneticRes * destination[1] - magBias[1];
-			//mz = (float)commpass[2] * magneticRes * destination[2] - magBias[2];
-
 			mpu_get_gyro_reg(gyro, &sensor_timestamp);
 			gx = (float)gyro[0] * (float)GyroScale / 32768.0f;
 			gy = (float)gyro[1] * (float)GyroScale / 32768.0f;
@@ -700,7 +703,7 @@ void loop() {
 				ay,
 				az,
 				gx * PI / 180.0f,
-				gy * PI / 180.0f,
+				-gy * PI / 180.0f,
 				-gz * PI / 180.0f,
 				my,
 				-mx,
@@ -719,19 +722,19 @@ void loop() {
 			lastUpdate = Now;
 
 			mpu_get_gyro_reg(gyro, &sensor_timestamp);
-			gx = gyro[0] * (float)GyroScale / 32768.0f;
-			gy = gyro[1] * (float)GyroScale / 32768.0f;
-			gz = gyro[2] * (float)GyroScale / 32768.0f;
+			gx = (float)gyro[0] * (float)GyroScale / 32768.0f;
+			gy = (float)gyro[1] * (float)GyroScale / 32768.0f;
+			gz = (float)gyro[2] * (float)GyroScale / 32768.0f;
 
 			mpu_get_accel_reg(accel, &sensor_timestamp);
-			ax = accel[0] * (float)AccelScale / 32768.0f;
-			ay = accel[1] * (float)AccelScale / 32768.0f;
-			az = accel[2] * (float)AccelScale / 32768.0f;
+			ax = ((float)accel[0] * (float)AccelScale - accelBias[0]) / 32768.0f;
+			ay = ((float)accel[1] * (float)AccelScale - accelBias[1]) / 32768.0f;
+			az = ((float)accel[2] * (float)AccelScale - accelBias[2]) / 32768.0f;
 
 			mpu_get_compass_reg(commpass, &sensor_timestamp);
-			mx = commpass[0] * 10.0f * 1229.0f / 4096.0f + 18.0f;
-			my = commpass[1] * 10.0f * 1229.0f / 4096.0f + 70.0f;
-			mz = commpass[2] * 10.0f * 1229.0f / 4096.0f + 270.0f;
+			mx = (float)commpass[0] * magneticRes * destination[0] - magBias[0];
+			my = (float)commpass[1] * magneticRes * destination[1] - magBias[1];
+			mz = (float)commpass[2] * magneticRes * destination[2] - magBias[2];
 
 			//-ax, ay, az, gx*pi/180.0f, -gy*pi/180.0f, -gz*pi/180.0f,  my,  -mx, mz
 			MahonyQuaternionUpdate(
@@ -740,14 +743,14 @@ void loop() {
 				Ki,
 				Kp,
 				deltat,
-				ax,
+				-ax,
 				ay,
 				az,
 				gx * PI / 180.0f,
-				gy * PI / 180.0f,
-				gz * PI / 180.0f,
+				-gy * PI / 180.0f,
+				-gz * PI / 180.0f,
 				my,
-				mx,
+				-mx,
 				mz
 			);
 		}
@@ -755,13 +758,12 @@ void loop() {
 		}
 
 		//Filter ëää÷ÉtÉBÉãÉ^
-		float a = filterNum;
-		if (a > 1.0f) { a = 1.0f; }
-		if (a < 0.0f) { a = 0.0f; }
-		quaternion.w = a * rawQuaternion.w - (1.0f - a) * Temp_quaternion.w;
-		quaternion.x = a * rawQuaternion.x - (1.0f - a) * Temp_quaternion.x;
-		quaternion.y = a * rawQuaternion.y - (1.0f - a) * Temp_quaternion.y;
-		quaternion.z = a * rawQuaternion.z - (1.0f - a) * Temp_quaternion.z;
+		if (filterNum > 1.0f) { filterNum = 1.0f; }
+		if (filterNum < 0.0f) { filterNum = 0.0f; }
+		quaternion.x = filterNum * rawQuaternion.x - (1.0f - filterNum) * Temp_quaternion.x;
+		quaternion.y = filterNum * rawQuaternion.y - (1.0f - filterNum) * Temp_quaternion.y;
+		quaternion.z = filterNum * rawQuaternion.z - (1.0f - filterNum) * Temp_quaternion.z;
+		quaternion.w = filterNum * rawQuaternion.w - (1.0f - filterNum) * Temp_quaternion.w;
 		Temp_quaternion = rawQuaternion;
 
 		//Output
