@@ -61,8 +61,8 @@ enum lpf_e {
 #define SERIAL_SPEED 230400
 
 enum {
-	DMP,		//Digital Motion Processor
-	MADGWICK,	//MadgwickQuaternionUpdate
+	DMP,		//Digital Motion Processor //OK
+	MADGWICK,	//MadgwickQuaternionUpdate //OK
 	MAHONY,		//MahonyQuaternionUpdate
 };
 
@@ -82,7 +82,7 @@ int CalibrationMode						= -1;
 const int GyroScale						= GYRO_2000DPS;
 const int AccelScale					= Accel_2G;
 const int lpf_rate						= INV_FILTER_188HZ;
-int filterNum							= 1.0f; //0.0f Å` 1.0fs
+int filterNum							= 5.5f; //0.0f Å` 1.0fs
 const float magneticRes					= 10.0f * 1229.0f / 4096.0f; // scale  milliGauss
 const unsigned short gyrosensitivity	= 131;  // = 131 LSB/degrees/sec
 const unsigned short accelsensitivity	= 16384;// = 16384 LSB/g
@@ -857,6 +857,7 @@ void loop() {
 			GetEulerAngle(&angle, &quaternion);
 
 			String outputBuffer =
+				//String(sensor_timestamp)	  + ',' +
 				String(angle.x - tempAngle.x) + ',' +
 				String(angle.y - tempAngle.y) + ',' +
 				String(angle.z - tempAngle.z) + '\n';
@@ -869,6 +870,7 @@ void loop() {
 			GetYawPitchRoll(&angle, &quaternion);
 
 			String outputBuffer =
+				//String(sensor_timestamp) + ',' +
 				String(angle.x - tempAngle.x) + ',' +  //Roll
 				String(angle.y - tempAngle.y) + ',' +  //Pitch
 				String(angle.z - tempAngle.z) + '\n';  //Yaw
