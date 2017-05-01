@@ -82,7 +82,7 @@ int CalibrationMode						= -1;
 const int GyroScale						= GYRO_2000DPS;
 const int AccelScale					= Accel_2G;
 const int lpf_rate						= INV_FILTER_188HZ;
-int filterNum							= 5.5f; //0.0f ～ 1.0fs
+int filterNum							= 0.9f; //0.0f ～ 1.0fs
 const float magneticRes					= 10.0f * 1229.0f / 4096.0f; // scale  milliGauss
 const unsigned short gyrosensitivity	= 131;  // = 131 LSB/degrees/sec
 const unsigned short accelsensitivity	= 16384;// = 16384 LSB/g
@@ -808,14 +808,14 @@ void loop() {
 		break;
 		}
 
-		//Filter 相関フィルタ
+		//Filter RCフィルタ
 		if (filterNum > 1.0f) { filterNum = 1.0f; }
 		if (filterNum < 0.0f) { filterNum = 0.0f; }
-		quaternion.x = filterNum * rawQuaternion.x - (1.0f - filterNum) * Temp_quaternion.x;
-		quaternion.y = filterNum * rawQuaternion.y - (1.0f - filterNum) * Temp_quaternion.y;
-		quaternion.z = filterNum * rawQuaternion.z - (1.0f - filterNum) * Temp_quaternion.z;
-		quaternion.w = filterNum * rawQuaternion.w - (1.0f - filterNum) * Temp_quaternion.w;
-		Temp_quaternion = rawQuaternion;
+		quaternion.x = filterNum * Temp_quaternion.x - (1.0f - filterNum) * rawQuaternion.x;
+		quaternion.y = filterNum * Temp_quaternion.y - (1.0f - filterNum) * rawQuaternion.y;
+		quaternion.z = filterNum * Temp_quaternion.z - (1.0f - filterNum) * rawQuaternion.z;
+		quaternion.w = filterNum * Temp_quaternion.w - (1.0f - filterNum) * rawQuaternion.w;
+		Temp_quaternion = quaternion;
 
 		//Output
 		switch (updateMode) {
