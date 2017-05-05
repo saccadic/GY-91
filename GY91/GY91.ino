@@ -82,7 +82,7 @@ int CalibrationMode						= -1;
 const int GyroScale						= GYRO_2000DPS;
 const int AccelScale					= Accel_2G;
 const int lpf_rate						= INV_FILTER_188HZ;
-int filterNum							= 0.9f; //0.0f ` 1.0fs
+int filterNum							= 0.9f; //0.0f ï¿½` 1.0fs
 const float magneticRes					= 10.0f * 1229.0f / 4096.0f; // scale  milliGauss
 const unsigned short gyrosensitivity	= 131;  // = 131 LSB/degrees/sec
 const unsigned short accelsensitivity	= 16384;// = 16384 LSB/g
@@ -722,9 +722,9 @@ void loop() {
 		break;
 		case MADGWICK:
 		{
-			float ax, ay, az; //‰Á‘¬“x
-			float gx, gy, gz; //Šp‘¬“x
-			float mx, my, mz; //’n¥‹C
+			float ax, ay, az; //ï¿½ï¿½ï¿½ï¿½ï¿½x
+			float gx, gy, gz; //ï¿½pï¿½ï¿½ï¿½x
+			float mx, my, mz; //ï¿½nï¿½ï¿½ï¿½C
 
 			Now = micros();
 			deltat = ((Now - lastUpdate) / 1000000.0f); // set integration time by time elapsed since last filter update
@@ -764,9 +764,9 @@ void loop() {
 		break;
 		case MAHONY:
 		{
-			float ax, ay, az; //‰Á‘¬“x
-			float gx, gy, gz; //Šp‘¬“x
-			float mx, my, mz; //’n¥‹C
+			float ax, ay, az; //ï¿½ï¿½ï¿½ï¿½ï¿½x
+			float gx, gy, gz; //ï¿½pï¿½ï¿½ï¿½x
+			float mx, my, mz; //ï¿½nï¿½ï¿½ï¿½C
 
 			Now = micros();
 			deltat = ((Now - lastUpdate) / 1000000.0f); // set integration time by time elapsed since last filter update
@@ -808,7 +808,7 @@ void loop() {
 		break;
 		}
 
-		//Filter RCƒtƒBƒ‹ƒ^
+		//Filter RCï¿½tï¿½Bï¿½ï¿½ï¿½^
 		if (filterNum > 1.0f) { filterNum = 1.0f; }
 		if (filterNum < 0.0f) { filterNum = 0.0f; }
 		quaternion.x = filterNum * Temp_quaternion.x - (1.0f - filterNum) * rawQuaternion.x;
@@ -821,9 +821,9 @@ void loop() {
 		switch (updateMode) {
 		case RAWDATA:
 		{
-			float ax, ay, az; //‰Á‘¬“x
-			float gx, gy, gz; //Šp‘¬“x
-			float mx, my, mz; //’n¥‹C
+			float ax, ay, az; //ï¿½ï¿½ï¿½ï¿½ï¿½x
+			float gx, gy, gz; //ï¿½pï¿½ï¿½ï¿½x
+			float mx, my, mz; //ï¿½nï¿½ï¿½ï¿½C
 
 			mpu_get_gyro_reg(gyro, &sensor_timestamp);
 			gx = gyro[0] * (float)GyroScale / 32768.0f;
